@@ -1,14 +1,14 @@
 [package]
 authors = ["Ricardo Martins <ricardo@scarybox.net>"]
-description = "A µTP (Micro/uTorrent Transport Library) library implemented in Rust"
+description = "Temporary fork of rust-utp. See https://github.com/meqif/rust-utp/pull/10"
 documentation = "http://meqif.github.io/rust-utp"
-homepage = "https://github.com/meqif/rust-utp"
+homepage = "https://github.com/maidsafe/rust-utp"
 keywords = ["utp", "networking", "protocol", "transport"]
 license = "MIT/Apache-2.0"
-name = "utp"
+name = "temp_utp"
 readme = "README.md"
 repository = "https://github.com/meqif/rust-utp"
-version = "0.6.3"
+version = "0.6.15"
 
 [dependencies]
 env_logger = "0.3"
