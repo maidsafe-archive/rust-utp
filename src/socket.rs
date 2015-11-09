@@ -2934,6 +2934,49 @@ mod test {
         test_network(timeout_exchange);
     }
 
+    #[test]
+    fn test_send_client_to_server() {
+        let listener = iotry!(UtpListener::bind("127.0.0.1:0"));
+        let server_addr = iotry!(listener.local_addr());
+
+        static TX_BUF: [u8; 10] = [0,1,2,3,4,5,6,7,8,9];
+
+        let client_t = thread::spawn(move || {
+            let mut client = iotry!(UtpSocket::connect(server_addr));
+            assert_eq!(iotry!(client.send_to(&TX_BUF)), TX_BUF.len());
+        });
+
+        let mut server = iotry!(listener.accept()).0;
+
+        let mut buf = [0; 10];
+        iotry!(server.recv_from(&mut buf));
+        assert_eq!(buf, TX_BUF);
+
+        assert!(client_t.join().is_ok());
+    }
+
+    // Test data exchange
+    #[test]
+    fn test_send_server_to_client() {
+        let listener = iotry!(UtpListener::bind("127.0.0.1:0"));
+        let server_addr = iotry!(listener.local_addr());
+
+        static TX_BUF: [u8; 10] = [0,1,2,3,4,5,6,7,8,9];
+
+        let client_t = thread::spawn(move || {
+            let mut client = iotry!(UtpSocket::connect(server_addr));
+            let mut buf = [0; 10];
+            iotry!(client.recv_from(&mut buf));
+            assert_eq!(buf, TX_BUF);
+        });
+
+        let mut server = iotry!(listener.accept()).0;
+
+        assert_eq!(iotry!(server.send_to(&TX_BUF)), TX_BUF.len());
+
+        assert!(client_t.join().is_ok());
+    }
+
     // Test data exchange
     #[test]
     fn test_data_exchange_utp() {
