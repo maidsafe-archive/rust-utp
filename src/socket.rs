@@ -534,6 +534,22 @@ impl UtpSocket {
         }
     }
 
+    #[cfg(windows)]
+    fn ignore_udp_error(e: &Error) -> bool {
+        match e.raw_os_error() {
+            Some(e) => match e {
+                10054 | 10040 => true,
+                _ => false,
+            },
+            None => false,
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn ignore_udp_error(_: &Error) -> bool {
+        false
+    }
+
     fn recv(&mut self, buf: &mut [u8], use_user_timeout: bool) -> Result<(usize, SocketAddr)> {
         let mut b = [0; BUF_SIZE + HEADER_SIZE];
         let now = SteadyTime::now();
@@ -605,11 +621,18 @@ impl UtpSocket {
                     if !use_user_timeout ||
                        ((now - self.last_congestion_update) >= congestion_timeout) {
                         self.last_congestion_update = now;
-                        try!(self.handle_receive_timeout());
+                        if let Err(e) = self.handle_receive_timeout() {
+                            println!("Could m-maybe be `{:?}`", e);
+                            return Err(e);
+                        }
                         self.retries += 1;
                     }
                 }
-                Err(e) => return Err(e),
+                Err(ref e) if Self::ignore_udp_error(e) => (),
+                Err(e) => {
+                    println!("Could it be because {:?} or `{:?}`", e.kind(), e);
+                    return Err(e)
+                }
             };
 
             let elapsed = (SteadyTime::now() - now).num_milliseconds();
