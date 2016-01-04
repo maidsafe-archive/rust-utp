@@ -2783,7 +2783,7 @@ mod test {
         assert!(child.join().is_ok());
     }
 
-    const NETWORK_NODE_COUNT: usize = 40;
+    const NETWORK_NODE_COUNT: usize = 20;
     const NETWORK_MSG_COUNT: usize = 5;
 
     fn test_network(exchange: fn(&mut UtpSocket) -> ()) {
@@ -2804,12 +2804,16 @@ mod test {
             }
 
             fn run(&mut self, exchange: fn(&mut UtpSocket) -> (), peer_addrs: Vec<SocketAddr>) {
+                let connect_cnt = peer_addrs.len();
+
                 let connect_join_handle = spawn(move || {
                     let mut send_jhs = Vec::<JoinHandle<()>>::new();
 
                     for peer_addr in peer_addrs {
-                        let mut socket = iotry!(UtpSocket::connect(peer_addr));
-                        send_jhs.push(spawn(move || { exchange(&mut socket) }));
+                        send_jhs.push(spawn(move || {
+                            let mut socket = iotry!(UtpSocket::connect(peer_addr));
+                            exchange(&mut socket);
+                        }));
                     }
 
                     for jh in send_jhs {
@@ -2819,9 +2823,11 @@ mod test {
 
                 let mut recv_jhs = Vec::<JoinHandle<()>>::new();
 
-                for _ in 0..NODE_COUNT-1 {
+                for _ in 0..NODE_COUNT-1-connect_cnt {
                     let mut socket = iotry!(self.listener.accept()).0;
-                    recv_jhs.push(spawn(move || { exchange(&mut socket) }));
+                    recv_jhs.push(spawn(move || {
+                        exchange(&mut socket);
+                    }));
                 }
 
                 for jh in recv_jhs {
@@ -2849,7 +2855,7 @@ mod test {
             let mut addrs = Vec::<SocketAddr>::new();
 
             for ai in 0..listening_addrs.len() {
-                if ai == ni { continue }
+                if ai <= ni { continue }
                 addrs.push(listening_addrs[ai].clone());
             }
 
