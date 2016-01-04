@@ -2872,37 +2872,44 @@ mod test {
     #[test]
     fn test_network_no_timeout() {
         static MSG_COUNT: usize  = NETWORK_MSG_COUNT;
-        static TX_BUF: [u8; 10] = [0,1,2,3,4,5,6,7,8,9];
+
+        fn make_buf(i: usize) -> [u8; 10] {
+            let mut buf = [0; 10];
+            for j in 0..10 {
+                buf[j] = (i + j) as u8;
+            }
+            buf
+        }
 
         fn sequential_exchange(socket: &mut UtpSocket) {
             let mut i = 0;
+            let from = socket.socket.local_addr().map(|addr| addr.port()).unwrap_or(0);
+            let to   = socket.connected_to.port();
+
             while i < MSG_COUNT {
-                assert_eq!(iotry!(socket.send_to(&TX_BUF)), TX_BUF.len());
+                let tx_buf = make_buf(i);
+                assert_eq!(iotry!(socket.send_to(&tx_buf)), tx_buf.len());
                 let mut buf = [0; 10];
+
                 match socket.recv_from(&mut buf) {
                     Ok((cnt, _)) => {
-                        if socket.state == SocketState::Connected {
-                            assert_eq!(cnt, 10);
-                            assert_eq!(buf, TX_BUF);
-                        } else {
-                            println!("socket is in an invliad state of {:?} from {:?} to {:?}",
-                                     socket.state, socket.socket.local_addr(), socket.connected_to);
+                        if cnt == 0 {
+                            if socket.state != SocketState::Connected {
+                                panic!("socket is in an invalid state \"{:?}\" from {:?} to {:?}",
+                                         socket.state, from, to);
+                            }
                         }
+                        assert_eq!(cnt, 10);
+                        assert_eq!(buf, make_buf(i));
                     },
-                    Err(ref err) if err.kind() == ErrorKind::NotConnected && i == MSG_COUNT - 1 => {
-                        // This is OK as it can happen on a congested network.
-                        println!("connection not established due to a congested network");
-                        break;
-                    },
-                    Err(_err) => {
-                        println!("failed in sending from {:?} to {:?}",
-                                 socket.socket.local_addr(), socket.connected_to);
-                        // panic!("Recv error {:?}", err);
+                    Err(err) => {
+                        panic!("Recv error {:?}; from {:?} to {:?}", err, from, to);
                     }
                 }
                 i += 1;
             }
         }
+
         for i in 0..100 {
             println!("------ Testing Network iteration {}", i);
             test_network(sequential_exchange);
