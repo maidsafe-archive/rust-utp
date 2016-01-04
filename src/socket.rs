@@ -1023,7 +1023,11 @@ impl UtpSocket {
         debug!("({:?}, {:?})", self.state, packet.get_type());
 
         // Acknowledge only if the packet strictly follows the previous one
-        if packet.seq_nr().wrapping_sub(self.ack_nr) == 1 {
+        // and only if it is a payload packet. The restriction on PacketType
+        // is due to all other (non Data) packets are assigned seq_nr the
+        // same as the next Data packet, thus we could acknowledge what
+        // we have not received yet.
+        if packet.get_type() == PacketType::Data && packet.seq_nr().wrapping_sub(self.ack_nr) == 1 {
             self.ack_nr = packet.seq_nr();
         }
 
@@ -1056,6 +1060,12 @@ impl UtpSocket {
                 self.last_dropped = self.ack_nr;
 
                 self.state_packet = Some(self.prepare_reply(packet, PacketType::State));
+
+                // Advance the self.seq_nr (the sequence number of the next packet),
+                // this is because the other end will use the `seq_nr` of this state
+                // packet as his `self.last_acked`
+                self.seq_nr = self.seq_nr.wrapping_add(1);
+
                 Ok(self.state_packet.clone())
             },
             (SocketState::Connected, PacketType::Syn) if self.connected_to == src => {
