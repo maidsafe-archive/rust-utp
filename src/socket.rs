@@ -1083,6 +1083,7 @@ impl UtpSocket {
                 self.seq_nr += 1;
                 self.state = SocketState::Connected;
                 self.last_acked = packet.ack_nr();
+                self.last_dropped = packet.seq_nr();
                 self.last_acked_timestamp = now_microseconds();
                 Ok(None)
             },
