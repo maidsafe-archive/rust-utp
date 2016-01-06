@@ -195,6 +195,10 @@ pub struct UtpSocket {
     last_congestion_update: SteadyTime,
 
     retries: u32,
+
+    /// The first 'State' packet we sent if we are a server (it may
+    /// need to be resent if the network dropped it).
+    state_packet: Option<Packet>,
 }
 
 impl UtpSocket {
@@ -244,6 +248,7 @@ impl UtpSocket {
             user_read_timeout: 0,
             last_congestion_update: SteadyTime::now(),
             retries: 0,
+            state_packet: None,
         }
     }
 
@@ -296,11 +301,11 @@ impl UtpSocket {
         packet.set_connection_id(socket.receiver_connection_id);
         packet.set_seq_nr(socket.seq_nr);
 
-        let mut len = 0;
         let mut buf = [0; BUF_SIZE];
-
         let mut syn_timeout = socket.congestion_timeout;
-        for _ in 0..MAX_SYN_RETRIES {
+        let mut syn_retries = 0;
+
+        while syn_retries < MAX_SYN_RETRIES {
             packet.set_timestamp_microseconds(now_microseconds());
 
             // Send packet
@@ -313,25 +318,34 @@ impl UtpSocket {
             socket.socket.set_read_timeout(Some(Duration::from_millis(syn_timeout)))
                 .expect("Error setting read timeout");
             match socket.socket.recv_from(&mut buf) {
-                Ok((read, src)) => { socket.connected_to = src; len = read; break; },
+                Ok((read, addr)) => {
+                    let packet = try!(Packet::from_bytes(&buf[..read]).or(Err(SocketError::InvalidPacket)));
+
+                    socket.connected_to = addr;
+
+                    if packet.get_type() != PacketType::State {
+                        // The network might have dropped the `State` packet
+                        // from the peer, so we need to ask for it again.
+                        syn_retries += 1;
+                        continue;
+                    }
+
+                    try!(socket.handle_packet(&packet, addr));
+
+                    return Ok(socket);
+                },
                 Err(ref e) if (e.kind() == ErrorKind::WouldBlock ||
                                e.kind() == ErrorKind::TimedOut) => {
                     debug!("Timed out, retrying");
                     syn_timeout *= 2;
+                    syn_retries += 1;
                     continue;
                 },
                 Err(e) => return Err(e),
             };
         }
 
-        let addr = socket.connected_to;
-        let packet = try!(Packet::from_bytes(&buf[..len]).or(Err(SocketError::InvalidPacket)));
-        debug!("received {:?}", packet);
-        try!(socket.handle_packet(&packet, addr));
-
-        debug!("connected to: {}", socket.connected_to);
-
-        return Ok(socket);
+        Err(Error::from(SocketError::ConnectionTimedOut))
     }
 
     /// If you have already prepared UDP sockets at each end (e.g. you're doing
@@ -1009,7 +1023,11 @@ impl UtpSocket {
         debug!("({:?}, {:?})", self.state, packet.get_type());
 
         // Acknowledge only if the packet strictly follows the previous one
-        if packet.seq_nr().wrapping_sub(self.ack_nr) == 1 {
+        // and only if it is a payload packet. The restriction on PacketType
+        // is due to all other (non Data) packets are assigned seq_nr the
+        // same as the next Data packet, thus we could acknowledge what
+        // we have not received yet.
+        if packet.get_type() == PacketType::Data && packet.seq_nr().wrapping_sub(self.ack_nr) == 1 {
             self.ack_nr = packet.seq_nr();
         }
 
@@ -1041,13 +1059,20 @@ impl UtpSocket {
                 self.state = SocketState::Connected;
                 self.last_dropped = self.ack_nr;
 
-                Ok(Some(self.prepare_reply(packet, PacketType::State)))
+                self.state_packet = Some(self.prepare_reply(packet, PacketType::State));
+
+                // Advance the self.seq_nr (the sequence number of the next packet),
+                // this is because the other end will use the `seq_nr` of this state
+                // packet as his `self.last_acked`
+                self.seq_nr = self.seq_nr.wrapping_add(1);
+
+                Ok(self.state_packet.clone())
             },
             (SocketState::Connected, PacketType::Syn) if self.connected_to == src => {
                 // The other end might have sent another Syn packet because
                 // a reply to the first one did not arrive within a timeout
                 // caused by network congestion.
-                Ok(None)
+                Ok(self.state_packet.clone())
             },
             (_, PacketType::Syn) => {
                 Ok(Some(self.prepare_reply(packet, PacketType::Reset)))
@@ -1058,6 +1083,7 @@ impl UtpSocket {
                 self.seq_nr += 1;
                 self.state = SocketState::Connected;
                 self.last_acked = packet.ack_nr();
+                self.last_dropped = packet.seq_nr();
                 self.last_acked_timestamp = now_microseconds();
                 Ok(None)
             },
@@ -2758,7 +2784,7 @@ mod test {
         assert!(child.join().is_ok());
     }
 
-    const NETWORK_NODE_COUNT: usize = 40;
+    const NETWORK_NODE_COUNT: usize = 20;
     const NETWORK_MSG_COUNT: usize = 5;
 
     fn test_network(exchange: fn(&mut UtpSocket) -> ()) {
@@ -2779,12 +2805,16 @@ mod test {
             }
 
             fn run(&mut self, exchange: fn(&mut UtpSocket) -> (), peer_addrs: Vec<SocketAddr>) {
+                let connect_cnt = peer_addrs.len();
+
                 let connect_join_handle = spawn(move || {
                     let mut send_jhs = Vec::<JoinHandle<()>>::new();
 
                     for peer_addr in peer_addrs {
-                        let mut socket = iotry!(UtpSocket::connect(peer_addr));
-                        send_jhs.push(spawn(move || { exchange(&mut socket) }));
+                        send_jhs.push(spawn(move || {
+                            let mut socket = iotry!(UtpSocket::connect(peer_addr));
+                            exchange(&mut socket);
+                        }));
                     }
 
                     for jh in send_jhs {
@@ -2794,9 +2824,11 @@ mod test {
 
                 let mut recv_jhs = Vec::<JoinHandle<()>>::new();
 
-                for _ in 0..NODE_COUNT-1 {
+                for _ in 0..NODE_COUNT-1-connect_cnt {
                     let mut socket = iotry!(self.listener.accept()).0;
-                    recv_jhs.push(spawn(move || { exchange(&mut socket) }));
+                    recv_jhs.push(spawn(move || {
+                        exchange(&mut socket);
+                    }));
                 }
 
                 for jh in recv_jhs {
@@ -2824,7 +2856,7 @@ mod test {
             let mut addrs = Vec::<SocketAddr>::new();
 
             for ai in 0..listening_addrs.len() {
-                if ai == ni { continue }
+                if ai <= ni { continue }
                 addrs.push(listening_addrs[ai].clone());
             }
 
@@ -2841,37 +2873,44 @@ mod test {
     #[test]
     fn test_network_no_timeout() {
         static MSG_COUNT: usize  = NETWORK_MSG_COUNT;
-        static TX_BUF: [u8; 10] = [0,1,2,3,4,5,6,7,8,9];
+
+        fn make_buf(i: usize) -> [u8; 10] {
+            let mut buf = [0; 10];
+            for j in 0..10 {
+                buf[j] = (i + j) as u8;
+            }
+            buf
+        }
 
         fn sequential_exchange(socket: &mut UtpSocket) {
             let mut i = 0;
+            let from = socket.socket.local_addr().map(|addr| addr.port()).unwrap_or(0);
+            let to   = socket.connected_to.port();
+
             while i < MSG_COUNT {
-                assert_eq!(iotry!(socket.send_to(&TX_BUF)), TX_BUF.len());
+                let tx_buf = make_buf(i);
+                assert_eq!(iotry!(socket.send_to(&tx_buf)), tx_buf.len());
                 let mut buf = [0; 10];
+
                 match socket.recv_from(&mut buf) {
                     Ok((cnt, _)) => {
-                        if socket.state == SocketState::Connected {
-                            assert_eq!(cnt, 10);
-                            assert_eq!(buf, TX_BUF);
-                        } else {
-                            println!("socket is in an invliad state of {:?} from {:?} to {:?}",
-                                     socket.state, socket.socket.local_addr(), socket.connected_to);
+                        if cnt == 0 {
+                            if socket.state != SocketState::Connected {
+                                panic!("socket is in an invalid state \"{:?}\" from {:?} to {:?}",
+                                         socket.state, from, to);
+                            }
                         }
+                        assert_eq!(cnt, 10);
+                        assert_eq!(buf, make_buf(i));
                     },
-                    Err(ref err) if err.kind() == ErrorKind::NotConnected && i == MSG_COUNT - 1 => {
-                        // This is OK as it can happen on a congested network.
-                        println!("connection not established due to a congested network");
-                        break;
-                    },
-                    Err(_err) => {
-                        println!("failed in sending from {:?} to {:?}",
-                                 socket.socket.local_addr(), socket.connected_to);
-                        // panic!("Recv error {:?}", err);
+                    Err(err) => {
+                        panic!("Recv error {:?}; from {:?} to {:?}", err, from, to);
                     }
                 }
                 i += 1;
             }
         }
+
         for i in 0..100 {
             println!("------ Testing Network iteration {}", i);
             test_network(sequential_exchange);
@@ -2932,6 +2971,50 @@ mod test {
         }
 
         test_network(timeout_exchange);
+    }
+
+    #[test]
+    fn test_send_client_to_server() {
+        let listener = iotry!(UtpListener::bind("127.0.0.1:0"));
+        let server_addr = iotry!(listener.local_addr());
+
+        static TX_BUF: [u8; 10] = [0,1,2,3,4,5,6,7,8,9];
+
+        let client_t = thread::spawn(move || {
+            let mut client = iotry!(UtpSocket::connect(server_addr));
+            assert_eq!(iotry!(client.send_to(&TX_BUF)), TX_BUF.len());
+        });
+
+        let mut server = iotry!(listener.accept()).0;
+
+        let mut buf = [0; 10];
+        iotry!(server.recv_from(&mut buf));
+        assert_eq!(buf, TX_BUF);
+
+        assert!(client_t.join().is_ok());
+    }
+
+    // Test data exchange
+    #[test]
+    fn test_send_server_to_client() {
+        let listener = iotry!(UtpListener::bind("127.0.0.1:0"));
+        let server_addr = iotry!(listener.local_addr());
+
+        static TX_BUF: [u8; 10] = [0,1,2,3,4,5,6,7,8,9];
+
+        let client_t = thread::spawn(move || {
+            let mut client = iotry!(UtpSocket::connect(server_addr));
+            let mut buf = [0; 10];
+            iotry!(client.recv_from(&mut buf));
+            assert_eq!(buf, TX_BUF);
+        });
+
+        let mut server = iotry!(listener.accept()).0;
+
+        assert_eq!(iotry!(server.send_to(&TX_BUF)), TX_BUF.len());
+        let _ = server.flush();
+
+        assert!(client_t.join().is_ok());
     }
 
     // Test data exchange
