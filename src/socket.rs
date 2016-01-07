@@ -753,7 +753,7 @@ impl UtpSocket {
 
         if !self.incoming_buffer.is_empty() &&
             (self.ack_nr == self.incoming_buffer[0].seq_nr() ||
-             self.ack_nr + 1 == self.incoming_buffer[0].seq_nr())
+             self.ack_nr.wrapping_add(1) == self.incoming_buffer[0].seq_nr())
         {
             let flushed = unsafe_copy(&self.incoming_buffer[0].payload[..], buf);
 
