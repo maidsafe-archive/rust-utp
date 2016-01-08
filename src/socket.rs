@@ -1282,7 +1282,7 @@ impl UtpSocket {
         // already resent.
         if !self.send_window.is_empty() && self.duplicate_ack_count == 3 &&
             !packet.extensions.iter().any(|ext| ext.get_type() == ExtensionType::SelectiveAck) {
-            self.resend_lost_packet(packet.ack_nr() + 1);
+            self.resend_lost_packet(packet.ack_nr().wrapping_add(1));
         }
 
         // Packet lost, halve the congestion window
