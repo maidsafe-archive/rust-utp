@@ -1456,10 +1456,6 @@ mod test {
         ($e:expr) => (match $e { Ok(e) => e, Err(e) => panic!("{:?}", e) })
     }
 
-    macro_rules! mutetry {
-        ($e:expr) => (match $e { Ok(e) => e, Err(e) => println!("{:?}", e) })
-    }
-
     fn next_test_port() -> u16 {
         use std::sync::atomic::{AtomicUsize, ATOMIC_USIZE_INIT, Ordering};
         static NEXT_OFFSET: AtomicUsize = ATOMIC_USIZE_INIT;
@@ -2830,7 +2826,7 @@ mod test {
                     }
 
                     for jh in send_jhs {
-                        mutetry!(jh.join());
+                        iotry!(jh.join());
                     }
                 });
 
@@ -2844,10 +2840,10 @@ mod test {
                 }
 
                 for jh in recv_jhs {
-                    mutetry!(jh.join());
+                    iotry!(jh.join());
                 }
 
-                mutetry!(connect_join_handle.join());
+                iotry!(connect_join_handle.join());
             }
         }
 
@@ -2878,7 +2874,7 @@ mod test {
         }
 
         for handle in join_handles {
-            mutetry!(handle.join());
+            iotry!(handle.join());
         }
     }
 
@@ -2913,7 +2909,12 @@ mod test {
                             }
                         }
                         assert_eq!(cnt, 10);
-                        assert_eq!(buf, make_buf(i));
+                        if buf != make_buf(i) {
+                            panic!("expected {:?} but received {:?} in recv step {}",
+                                   make_buf(i),
+                                   buf,
+                                   i);
+                        }
                     },
                     Err(err) => {
                         panic!("Recv error {:?}; from {:?} to {:?}", err, from, to);
@@ -2932,17 +2933,30 @@ mod test {
     #[test]
     fn test_network_with_timeout() {
         static MSG_COUNT: usize  = NETWORK_MSG_COUNT;
-        static TX_BUF: [u8; 10] = [0,1,2,3,4,5,6,7,8,9];
+
+        fn make_buf(i: usize) -> [u8; 10] {
+            let mut buf = [0; 10];
+            for j in 0..10 {
+                buf[j] = (i + j) as u8;
+            }
+            buf
+        }
 
         fn timeout_exchange(socket: &mut UtpSocket) {
             socket.set_read_timeout(Some(50));
             let mut recv_cnt = 0;
             let mut send_cnt = 0;
+
+            let from = socket.socket.local_addr().map(|addr| addr.port()).unwrap_or(0);
+            let to   = socket.connected_to.port();
+
             loop {
                 if send_cnt < MSG_COUNT {
-                    match socket.send_to(&TX_BUF) {
+                    let tx_buf = make_buf(send_cnt);
+
+                    match socket.send_to(&tx_buf) {
                         Ok(cnt) => {
-                            assert_eq!(cnt, TX_BUF.len());
+                            assert_eq!(cnt, tx_buf.len());
                             send_cnt += 1;
                         },
                         Err(ref e) if e.kind() == ErrorKind::TimedOut => {
@@ -2953,36 +2967,42 @@ mod test {
                     }
                 }
                 if recv_cnt < MSG_COUNT {
+                    let exp_buf = make_buf(recv_cnt);
+
                     let mut buf = [0; 10];
                     match socket.recv_from(&mut buf) {
                         Ok((cnt, _)) => {
-                            recv_cnt += 1;
                             if cnt == 0 {
-                                // Zero size msg will be returned if the socket is in Closed state
-                                println!("received a message size of zero");
-                                continue
+                                if socket.state != SocketState::Connected {
+                                    panic!("socket is in an invalid state \"{:?}\" \
+                                           from {:?} to {:?} in receive #{}",
+                                             socket.state, from, to, recv_cnt);
+                                }
                             } else {
-                                assert_eq!(cnt, TX_BUF.len());
-                                assert_eq!(buf, TX_BUF);
+                                assert_eq!(cnt, exp_buf.len());
+                                assert_eq!(buf, exp_buf);
+                                recv_cnt += 1;
                             }
                         },
                         Err(ref e) if e.kind() == ErrorKind::TimedOut => {
-                        },
-                        Err(ref e) if e.kind() == ErrorKind::NotConnected && send_cnt == MSG_COUNT=> {
-                            break;
                         },
                         Err(e) => {
                             panic!("{:?} recv_cnt={} send_cnt={}", e, recv_cnt, send_cnt);
                         }
                     }
                 }
+
                 if send_cnt == MSG_COUNT && recv_cnt == MSG_COUNT {
                     break;
                 }
             }
         }
 
-        test_network(timeout_exchange);
+
+        for i in 0..100 {
+            println!("------ Testing Network iteration {}", i);
+            test_network(timeout_exchange);
+        }
     }
 
     #[test]
@@ -3024,7 +3044,8 @@ mod test {
         let mut server = iotry!(listener.accept()).0;
 
         assert_eq!(iotry!(server.send_to(&TX_BUF)), TX_BUF.len());
-        let _ = server.flush();
+        let fr = server.flush();
+        assert!(fr.is_ok());
 
         assert!(client_t.join().is_ok());
     }
@@ -3051,6 +3072,7 @@ mod test {
         let mut buf = [0; 10];
         iotry!(server.recv_from(&mut buf));
         assert_eq!(buf, TX_BUF);
+        let _ = server.flush();
 
         assert!(client_t.join().is_ok());
     }
