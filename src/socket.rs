@@ -1107,6 +1107,14 @@ impl UtpSocket {
                 if packet.ack_nr() < self.seq_nr {
                     debug!("FIN received but there are missing acknowledgements for sent packets");
                 }
+
+                // TODO: Not 100% sure about this one, but it does seem
+                // to help in closing the sockets sooner.
+                //
+                // The other end is no longer interested in the content
+                // of our Data packets.
+                self.send_window.clear();
+
                 let mut reply = self.prepare_reply(packet, PacketType::State);
                 if packet.seq_nr().wrapping_sub(self.ack_nr) > 1 {
                     debug!("current ack_nr ({}) is behind received packet seq_nr ({})",
