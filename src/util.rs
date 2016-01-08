@@ -24,6 +24,17 @@ pub fn abs_diff(a: u32, b: u32) -> u32 {
     }
 }
 
+pub struct Sequence;
+
+impl Sequence {
+    pub fn less(a: u16, b: u16) -> bool {
+        const MIDDLE_VALUE: u16 = ::std::u16::MAX / 2;
+
+        ((b > a) && (b - a <= MIDDLE_VALUE)) ||
+        ((b < a) && (a - b >  MIDDLE_VALUE))
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::ewma;

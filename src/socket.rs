@@ -2,7 +2,7 @@ use std::cmp::{min, max};
 use std::collections::VecDeque;
 use std::net::{ToSocketAddrs, SocketAddr, UdpSocket};
 use std::io::{Result, Error, ErrorKind};
-use util::{now_microseconds, ewma, abs_diff};
+use util::{now_microseconds, ewma, abs_diff, Sequence};
 use packet::{Packet, PacketType, Encodable, Decodable, ExtensionType, HEADER_SIZE};
 use rand::{self, Rng};
 use time::SteadyTime;
@@ -636,9 +636,10 @@ impl UtpSocket {
 
         // Insert data packet into the incoming buffer if it isn't a duplicate of a previously
         // discarded packet
-        if packet.get_type() == PacketType::Data &&
-            packet.seq_nr().wrapping_sub(self.last_dropped) > 0 {
-            self.insert_into_buffer(packet);
+        if packet.get_type() == PacketType::Data {
+            if Sequence::less(self.last_dropped, packet.seq_nr()) {
+                self.insert_into_buffer(packet);
+            }
         }
 
         // Flush incoming buffer if possible
