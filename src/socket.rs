@@ -2,6 +2,7 @@ use std::cmp::{min, max};
 use std::collections::VecDeque;
 use std::net::{ToSocketAddrs, SocketAddr, UdpSocket};
 use std::io::{Result, Error, ErrorKind};
+use std::sync::{Arc, Mutex};
 use util::{now_microseconds, ewma, Sequence};
 use packet::{Packet, PacketType, Encodable, Decodable, ExtensionType, HEADER_SIZE};
 use rand::{self, Rng};
@@ -95,39 +96,7 @@ fn unsafe_copy(src: &[u8], dst: &mut [u8]) -> usize {
     max_len
 }
 
-/// A structure that represents a uTP (Micro Transport Protocol) connection between a local socket
-/// and a remote socket.
-///
-/// The socket will be closed when the value is dropped (either explicitly or when it goes out of
-/// scope).
-///
-/// The default maximum retransmission retries is 5, which translates to about 16 seconds. It can be
-/// changed by assigning the desired maximum retransmission retries to a socket's
-/// `max_retransmission_retries` field. Notice that the initial congestion timeout is 500 ms and
-/// doubles with each timeout.
-///
-/// # Examples
-///
-/// ```no_run
-/// use utp::UtpSocket;
-///
-/// let mut socket = UtpSocket::bind("127.0.0.1:1234").expect("Error binding socket");
-///
-/// let mut buf = [0; 1000];
-/// let (amt, _src) = socket.recv_from(&mut buf).expect("Error receiving");
-///
-/// let mut buf = &mut buf[..amt];
-/// buf.reverse();
-/// let _ = socket.send_to(buf).expect("Error sending");
-///
-/// // Close the socket. You can either call `close` on the socket,
-/// // explicitly drop it or just let it go out of scope.
-/// socket.close();
-/// ```
-pub struct UtpSocket {
-    /// The wrapped UDP socket
-    socket: UdpSocket,
-
+struct UtpSocketInner {
     /// Remote peer
     connected_to: SocketAddr,
 
@@ -205,7 +174,7 @@ pub struct UtpSocket {
     cwnd: u32,
 
     /// Maximum retransmission retries
-    pub max_retransmission_retries: u32,
+    max_retransmission_retries: u32,
 
     /// Used by `set_read_timeout`.
     user_read_timeout: u64,
@@ -218,6 +187,330 @@ pub struct UtpSocket {
     /// The first 'State' packet we sent if we are a server (it may
     /// need to be resent if the network dropped it).
     state_packet: Option<Packet>,
+}
+
+impl UtpSocketInner {
+    pub fn prepare_reply(&self, original: &Packet, t: PacketType) -> Packet {
+        let mut resp = Packet::new();
+        resp.set_type(t);
+        let self_t_micro: u32 = now_microseconds();
+        let other_t_micro: u32 = original.timestamp_microseconds();
+        resp.set_timestamp_microseconds(self_t_micro);
+        resp.set_timestamp_difference_microseconds(self_t_micro.wrapping_sub(other_t_micro));
+        resp.set_connection_id(self.sender_connection_id);
+        resp.set_seq_nr(self.seq_nr);
+        resp.set_ack_nr(self.ack_nr);
+
+        resp
+    }
+
+    /// Removes a packet in the incoming buffer and updates the current acknowledgement number.
+    pub fn advance_incoming_buffer(&mut self) -> Option<Packet> {
+        if !self.incoming_buffer.is_empty() {
+            let packet = self.incoming_buffer.remove(0);
+            debug!("Removed packet from incoming buffer: {:?}", packet);
+            self.ack_nr = packet.seq_nr();
+            self.last_dropped = self.ack_nr;
+            Some(packet)
+        } else {
+            None
+        }
+    }
+
+    /// Discards sequential, ordered packets in incoming buffer, starting from
+    /// the most recently acknowledged to the most recent, as long as there are
+    /// no missing packets. The discarded packets' payload is written to the
+    /// slice `buf`, starting in position `start`.
+    /// Returns the last written index.
+    fn flush_incoming_buffer(&mut self, buf: &mut [u8]) -> usize {
+        // Return pending data from a partially read packet
+        if !self.pending_data.is_empty() {
+            let flushed = {
+                let (pending_0, pending_1) = self.pending_data.as_slices();
+                let mut flushed = 0;
+                if pending_0.len() > 0 {
+                    flushed += unsafe_copy(pending_0, buf);
+                }
+                if pending_1.len() > 0 {
+                    flushed += unsafe_copy(pending_1, &mut buf[flushed..]);
+                }
+                flushed
+            };
+
+            if flushed == self.pending_data.len() {
+                self.pending_data.clear();
+                self.advance_incoming_buffer();
+            } else {
+                self.pending_data.drain(..flushed);
+            }
+
+            return flushed;
+        }
+
+        if !self.incoming_buffer.is_empty() &&
+           (self.ack_nr == self.incoming_buffer[0].seq_nr() ||
+            self.ack_nr.wrapping_add(1) == self.incoming_buffer[0].seq_nr())
+        {
+            let flushed = unsafe_copy(&self.incoming_buffer[0].payload[..], buf);
+
+            if flushed == self.incoming_buffer[0].payload.len() {
+                self.advance_incoming_buffer();
+            } else {
+                self.pending_data.extend(self.incoming_buffer[0].payload.drain(flushed..));
+            }
+
+            return flushed;
+        }
+
+        0
+    }
+
+    // Insert a new sample in the base delay list.
+    //
+    // The base delay list contains at most `BASE_HISTORY` samples, each sample is the minimum
+    // measured over a period of a minute (MAX_BASE_DELAY_AGE).
+    fn update_base_delay(&mut self, base_delay: i64, now: i64) {
+        if self.base_delays.is_empty() || now - self.last_rollover > MAX_BASE_DELAY_AGE {
+            // Update last rollover
+            self.last_rollover = now;
+
+            // Drop the oldest sample, if need be
+            if self.base_delays.len() == BASE_HISTORY {
+                self.base_delays.pop_front();
+            }
+
+            // Insert new sample
+            self.base_delays.push_back(base_delay);
+        } else {
+            // Replace sample for the current minute if the delay is lower
+            let last_idx = self.base_delays.len() - 1;
+            if base_delay < self.base_delays[last_idx] {
+                self.base_delays[last_idx] = base_delay;
+            }
+        }
+    }
+
+    /// Inserts a new sample in the current delay list after removing samples older than one RTT, as
+    /// specified in RFC6817.
+    fn update_current_delay(&mut self, v: i64, now: i64) {
+        // Remove samples more than one RTT old
+        let rtt = self.rtt as i64 * 100;
+        while !self.current_delays.is_empty() && now - self.current_delays[0].received_at > rtt {
+            self.current_delays.remove(0);
+        }
+
+        // Insert new measurement
+        self.current_delays.push(DelayDifferenceSample {
+            received_at: now,
+            difference: v,
+        });
+    }
+
+    fn update_congestion_timeout(&mut self, current_delay: i32) {
+        let delta = self.rtt - current_delay;
+        self.rtt_variance += (delta.abs() - self.rtt_variance) / 4;
+        self.rtt += (current_delay - self.rtt) / 8;
+        self.congestion_timeout = max((self.rtt + self.rtt_variance * 4) as u64,
+                                      MIN_CONGESTION_TIMEOUT);
+        self.congestion_timeout = min(self.congestion_timeout, MAX_CONGESTION_TIMEOUT);
+
+        debug!("current_delay: {}", current_delay);
+        debug!("delta: {}", delta);
+        debug!("self.rtt_variance: {}", self.rtt_variance);
+        debug!("self.rtt: {}", self.rtt);
+        debug!("self.congestion_timeout: {}", self.congestion_timeout);
+    }
+
+    /// Calculates the filtered current delay in the current window.
+    ///
+    /// The current delay is calculated through application of the exponential
+    /// weighted moving average filter with smoothing factor 0.333 over the
+    /// current delays in the current window.
+    fn filtered_current_delay(&self) -> i64 {
+        let input = self.current_delays.iter().map(|x| x.difference);
+        ewma(input, 0.333) as i64
+    }
+
+    /// Calculates the lowest base delay in the current window.
+    fn min_base_delay(&self) -> i64 {
+        self.base_delays.iter().min().cloned().unwrap_or(0)
+    }
+
+    /// Builds the selective acknowledgement extension data for usage in packets.
+    fn build_selective_ack(&self) -> Vec<u8> {
+        let stashed = self.incoming_buffer
+                          .iter()
+                          .filter(|pkt| pkt.seq_nr() > self.ack_nr + 1)
+                          .map(|pkt| (pkt.seq_nr() - self.ack_nr - 2) as usize)
+                          .map(|diff| (diff / 8, diff % 8));
+
+        let mut sack = Vec::new();
+        for (byte, bit) in stashed {
+            // Make sure the amount of elements in the SACK vector is a
+            // multiple of 4 and enough to represent the lost packets
+            while byte >= sack.len() || sack.len() % 4 != 0 {
+                sack.push(0u8);
+            }
+
+            sack[byte] |= 1 << bit;
+        }
+
+        sack
+    }
+
+    /// Forgets sent packets that were acknowledged by the remote peer.
+    fn advance_send_window(&mut self) {
+        // The reason I'm not removing the first element in a loop while its sequence number is
+        // smaller than `last_acked` is because of wrapping sequence numbers, which would create the
+        // sequence [..., 65534, 65535, 0, 1, ...]. If `last_acked` is smaller than the first
+        // packet's sequence number because of wraparound (for instance, 1), no packets would be
+        // removed, as the condition `seq_nr < last_acked` would fail immediately.
+        //
+        // On the other hand, I can't keep removing the first packet in a loop until its sequence
+        // number matches `last_acked` because it might never match, and in that case no packets
+        // should be removed.
+        if let Some(position) = self.send_window
+                                    .iter()
+                                    .position(|pkt| pkt.seq_nr() == self.last_acked) {
+            for _ in 0..position + 1 {
+                let packet = self.send_window.remove(0);
+                self.curr_window -= packet.len() as u32;
+            }
+        }
+        debug!("self.curr_window: {}", self.curr_window);
+    }
+
+    fn handle_data_packet(&mut self, packet: &Packet) -> Option<Packet> {
+        // If a FIN was previously sent, reply with a FIN packet acknowledging the received packet.
+        let packet_type = if self.state == SocketState::FinSent {
+            PacketType::Fin
+        } else {
+            PacketType::State
+        };
+        let mut reply = self.prepare_reply(packet, packet_type);
+
+        if packet.seq_nr().wrapping_sub(self.ack_nr) > 1 {
+            debug!("current ack_nr ({}) is behind received packet seq_nr ({})",
+                   self.ack_nr,
+                   packet.seq_nr());
+
+            // Set SACK extension payload if the packet is not in order
+            let sack = self.build_selective_ack();
+
+            if sack.len() > 0 {
+                reply.set_sack(sack);
+            }
+        }
+
+        Some(reply)
+    }
+
+    fn queuing_delay(&self) -> i64 {
+        let filtered_current_delay = self.filtered_current_delay();
+        let min_base_delay = self.min_base_delay();
+        let queuing_delay = filtered_current_delay - min_base_delay;
+
+        debug!("filtered_current_delay: {}", filtered_current_delay);
+        debug!("min_base_delay: {}", min_base_delay);
+        debug!("queuing_delay: {}", queuing_delay);
+
+        queuing_delay
+    }
+
+    /// Calculates the new congestion window size, increasing it or decreasing it.
+    ///
+    /// This is the core of uTP, the [LEDBAT][ledbat_rfc] congestion algorithm. It depends on
+    /// estimating the queuing delay between the two peers, and adjusting the congestion window
+    /// accordingly.
+    ///
+    /// `off_target` is a normalized value representing the difference between the current queuing
+    /// delay and a fixed target delay (`TARGET`). `off_target` ranges between -1.0 and 1.0. A
+    /// positive value makes the congestion window increase, while a negative value makes the
+    /// congestion window decrease.
+    ///
+    /// `bytes_newly_acked` is the number of bytes acknowledged by an inbound `State` packet. It may
+    /// be the size of the packet explicitly acknowledged by the inbound packet (i.e., with sequence
+    /// number equal to the inbound packet's acknowledgement number), or every packet implicitly
+    /// acknowledged (every packet with sequence number between the previous inbound `State`
+    /// packet's acknowledgement number and the current inbound `State` packet's acknowledgement
+    /// number).
+    ///
+    ///[ledbat_rfc]: https://tools.ietf.org/html/rfc6817
+    fn update_congestion_window(&mut self, off_target: f64, bytes_newly_acked: u32) {
+        let flightsize = self.curr_window;
+
+        let cwnd_increase = GAIN * off_target * bytes_newly_acked as f64 * MSS as f64;
+        let cwnd_increase = cwnd_increase / self.cwnd as f64;
+        debug!("cwnd_increase: {}", cwnd_increase);
+
+        self.cwnd = (self.cwnd as f64 + cwnd_increase) as u32;
+        let max_allowed_cwnd = flightsize + ALLOWED_INCREASE * MSS;
+        self.cwnd = min(self.cwnd, max_allowed_cwnd);
+        self.cwnd = max(self.cwnd, MIN_CWND * MSS);
+
+        debug!("cwnd: {}", self.cwnd);
+        debug!("max_allowed_cwnd: {}", max_allowed_cwnd);
+    }
+
+    /// Inserts a packet into the socket's buffer.
+    ///
+    /// The packet is inserted in such a way that the packets in the buffer are sorted according to
+    /// their sequence number in ascending order. This allows storing packets that were received out
+    /// of order.
+    ///
+    /// Trying to insert a duplicate of a packet will silently fail.
+    /// it's more recent (larger timestamp).
+    fn insert_into_buffer(&mut self, packet: Packet) {
+        // Immediately push to the end if the packet's sequence number comes after the last
+        // packet's.
+        if self.incoming_buffer.last().map(|p| packet.seq_nr() > p.seq_nr()).unwrap_or(false) {
+            self.incoming_buffer.push(packet);
+        } else {
+            // Find index following the most recent packet before the one we wish to insert
+            let i = self.incoming_buffer.iter().filter(|p| p.seq_nr() < packet.seq_nr()).count();
+
+            if self.incoming_buffer.get(i).map(|p| p.seq_nr() != packet.seq_nr()).unwrap_or(true) {
+                self.incoming_buffer.insert(i, packet);
+            }
+        }
+    }
+}
+
+/// A structure that represents a uTP (Micro Transport Protocol) connection between a local socket
+/// and a remote socket.
+///
+/// The socket will be closed when the value is dropped (either explicitly or when it goes out of
+/// scope).
+///
+/// The default maximum retransmission retries is 5, which translates to about 16 seconds. It can be
+/// changed by assigning the desired maximum retransmission retries to a socket's
+/// `max_retransmission_retries` field. Notice that the initial congestion timeout is 500 ms and
+/// doubles with each timeout.
+///
+/// # Examples
+///
+/// ```no_run
+/// use utp::UtpSocket;
+///
+/// let mut socket = UtpSocket::bind("127.0.0.1:1234").expect("Error binding socket");
+///
+/// let mut buf = [0; 1000];
+/// let (amt, _src) = socket.recv_from(&mut buf).expect("Error receiving");
+///
+/// let mut buf = &mut buf[..amt];
+/// buf.reverse();
+/// let _ = socket.send_to(buf).expect("Error sending");
+///
+/// // Close the socket. You can either call `close` on the socket,
+/// // explicitly drop it or just let it go out of scope.
+/// socket.close();
+/// ```
+pub struct UtpSocket {
+    /// The wrapped UDP socket
+    socket: UdpSocket,
+
+    /// The inner state of the socket, shared between all clones of this socket.
+    inner: Arc<Mutex<UtpSocketInner>>,
 }
 
 impl UtpSocket {
@@ -240,8 +533,7 @@ impl UtpSocket {
                 }
             }();
 
-        UtpSocket {
-            socket: s,
+        let inner = Arc::new(Mutex::new(UtpSocketInner {
             connected_to: src,
             receiver_connection_id: receiver_id,
             sender_connection_id: sender_id,
@@ -272,6 +564,11 @@ impl UtpSocket {
             last_congestion_update: SteadyTime::now(),
             retries: 0,
             state_packet: None,
+        }));
+
+        UtpSocket {
+            socket: s,
+            inner: inner,
         }
     }
 
@@ -297,8 +594,9 @@ impl UtpSocket {
 
     /// Returns the socket address of the remote peer of this UTP connection.
     pub fn peer_addr(&self) -> Result<SocketAddr> {
-        if self.state == SocketState::Connected || self.state == SocketState::FinSent {
-            Ok(self.connected_to)
+        let inner = self.inner.lock().unwrap();
+        if inner.state == SocketState::Connected || inner.state == SocketState::FinSent {
+            Ok(inner.connected_to)
         } else {
             Err(Error::from(SocketError::NotConnected))
         }
@@ -317,24 +615,25 @@ impl UtpSocket {
             SocketAddr::V6(_) => ":::0",
         };
         let mut socket = try!(UtpSocket::bind(my_addr));
-        socket.connected_to = addr;
+        let inner = socket.inner.lock().unwrap();
+        inner.connected_to = addr;
 
         let mut packet = Packet::new();
         packet.set_type(PacketType::Syn);
-        packet.set_connection_id(socket.receiver_connection_id);
-        packet.set_seq_nr(socket.seq_nr);
+        packet.set_connection_id(inner.receiver_connection_id);
+        packet.set_seq_nr(inner.seq_nr);
 
         let mut buf = [0; BUF_SIZE];
-        let mut syn_timeout = socket.congestion_timeout;
+        let mut syn_timeout = inner.congestion_timeout;
         let mut syn_retries = 0;
 
         while syn_retries < MAX_SYN_RETRIES {
             packet.set_timestamp_microseconds(now_microseconds());
 
             // Send packet
-            debug!("Connecting to {}", socket.connected_to);
-            try!(socket.socket.send_to(&packet.to_bytes()[..], socket.connected_to));
-            socket.state = SocketState::SynSent;
+            debug!("Connecting to {}", inner.connected_to);
+            try!(socket.socket.send_to(&packet.to_bytes()[..], inner.connected_to));
+            inner.state = SocketState::SynSent;
             debug!("sent {:?}", packet);
 
             // Validate response
@@ -345,7 +644,7 @@ impl UtpSocket {
                 Ok((read, addr)) => {
                     let packet = try!(Packet::from_bytes(&buf[..read]).or(Err(SocketError::InvalidPacket)));
 
-                    socket.connected_to = addr;
+                    inner.connected_to = addr;
 
                     if packet.get_type() != PacketType::State {
                         // The network might have dropped the `State` packet
@@ -353,6 +652,7 @@ impl UtpSocket {
                         syn_retries += 1;
                         continue;
                     }
+                    drop(inner);
 
                     try!(socket.handle_packet(&packet, addr));
 
@@ -781,81 +1081,6 @@ impl UtpSocket {
         Ok(())
     }
 
-    fn prepare_reply(&self, original: &Packet, t: PacketType) -> Packet {
-        let mut resp = Packet::new();
-        resp.set_type(t);
-        let self_t_micro: u32 = now_microseconds();
-        let other_t_micro: u32 = original.timestamp_microseconds();
-        resp.set_timestamp_microseconds(self_t_micro);
-        resp.set_timestamp_difference_microseconds(self_t_micro.wrapping_sub(other_t_micro));
-        resp.set_connection_id(self.sender_connection_id);
-        resp.set_seq_nr(self.seq_nr);
-        resp.set_ack_nr(self.ack_nr);
-
-        resp
-    }
-
-    /// Removes a packet in the incoming buffer and updates the current acknowledgement number.
-    fn advance_incoming_buffer(&mut self) -> Option<Packet> {
-        if !self.incoming_buffer.is_empty() {
-            let packet = self.incoming_buffer.remove(0);
-            debug!("Removed packet from incoming buffer: {:?}", packet);
-            self.ack_nr = packet.seq_nr();
-            self.last_dropped = self.ack_nr;
-            Some(packet)
-        } else {
-            None
-        }
-    }
-
-    /// Discards sequential, ordered packets in incoming buffer, starting from
-    /// the most recently acknowledged to the most recent, as long as there are
-    /// no missing packets. The discarded packets' payload is written to the
-    /// slice `buf`, starting in position `start`.
-    /// Returns the last written index.
-    fn flush_incoming_buffer(&mut self, buf: &mut [u8]) -> usize {
-        // Return pending data from a partially read packet
-        if !self.pending_data.is_empty() {
-            let flushed = {
-                let (pending_0, pending_1) = self.pending_data.as_slices();
-                let mut flushed = 0;
-                if pending_0.len() > 0 {
-                    flushed += unsafe_copy(pending_0, buf);
-                }
-                if pending_1.len() > 0 {
-                    flushed += unsafe_copy(pending_1, &mut buf[flushed..]);
-                }
-                flushed
-            };
-
-            if flushed == self.pending_data.len() {
-                self.pending_data.clear();
-                self.advance_incoming_buffer();
-            } else {
-                self.pending_data.drain(..flushed);
-            }
-
-            return flushed;
-        }
-
-        if !self.incoming_buffer.is_empty() &&
-           (self.ack_nr == self.incoming_buffer[0].seq_nr() ||
-            self.ack_nr.wrapping_add(1) == self.incoming_buffer[0].seq_nr())
-        {
-            let flushed = unsafe_copy(&self.incoming_buffer[0].payload[..], buf);
-
-            if flushed == self.incoming_buffer[0].payload.len() {
-                self.advance_incoming_buffer();
-            } else {
-                self.pending_data.extend(self.incoming_buffer[0].payload.drain(flushed..));
-            }
-
-            return flushed;
-        }
-
-        0
-    }
-
     /// Sends data on the socket to the remote peer. On success, returns the number of bytes
     /// written.
     //
@@ -977,99 +1202,6 @@ impl UtpSocket {
         Ok(())
     }
 
-    // Insert a new sample in the base delay list.
-    //
-    // The base delay list contains at most `BASE_HISTORY` samples, each sample is the minimum
-    // measured over a period of a minute (MAX_BASE_DELAY_AGE).
-    fn update_base_delay(&mut self, base_delay: i64, now: i64) {
-        if self.base_delays.is_empty() || now - self.last_rollover > MAX_BASE_DELAY_AGE {
-            // Update last rollover
-            self.last_rollover = now;
-
-            // Drop the oldest sample, if need be
-            if self.base_delays.len() == BASE_HISTORY {
-                self.base_delays.pop_front();
-            }
-
-            // Insert new sample
-            self.base_delays.push_back(base_delay);
-        } else {
-            // Replace sample for the current minute if the delay is lower
-            let last_idx = self.base_delays.len() - 1;
-            if base_delay < self.base_delays[last_idx] {
-                self.base_delays[last_idx] = base_delay;
-            }
-        }
-    }
-
-    /// Inserts a new sample in the current delay list after removing samples older than one RTT, as
-    /// specified in RFC6817.
-    fn update_current_delay(&mut self, v: i64, now: i64) {
-        // Remove samples more than one RTT old
-        let rtt = self.rtt as i64 * 100;
-        while !self.current_delays.is_empty() && now - self.current_delays[0].received_at > rtt {
-            self.current_delays.remove(0);
-        }
-
-        // Insert new measurement
-        self.current_delays.push(DelayDifferenceSample {
-            received_at: now,
-            difference: v,
-        });
-    }
-
-    fn update_congestion_timeout(&mut self, current_delay: i32) {
-        let delta = self.rtt - current_delay;
-        self.rtt_variance += (delta.abs() - self.rtt_variance) / 4;
-        self.rtt += (current_delay - self.rtt) / 8;
-        self.congestion_timeout = max((self.rtt + self.rtt_variance * 4) as u64,
-                                      MIN_CONGESTION_TIMEOUT);
-        self.congestion_timeout = min(self.congestion_timeout, MAX_CONGESTION_TIMEOUT);
-
-        debug!("current_delay: {}", current_delay);
-        debug!("delta: {}", delta);
-        debug!("self.rtt_variance: {}", self.rtt_variance);
-        debug!("self.rtt: {}", self.rtt);
-        debug!("self.congestion_timeout: {}", self.congestion_timeout);
-    }
-
-    /// Calculates the filtered current delay in the current window.
-    ///
-    /// The current delay is calculated through application of the exponential
-    /// weighted moving average filter with smoothing factor 0.333 over the
-    /// current delays in the current window.
-    fn filtered_current_delay(&self) -> i64 {
-        let input = self.current_delays.iter().map(|x| x.difference);
-        ewma(input, 0.333) as i64
-    }
-
-    /// Calculates the lowest base delay in the current window.
-    fn min_base_delay(&self) -> i64 {
-        self.base_delays.iter().min().cloned().unwrap_or(0)
-    }
-
-    /// Builds the selective acknowledgement extension data for usage in packets.
-    fn build_selective_ack(&self) -> Vec<u8> {
-        let stashed = self.incoming_buffer
-                          .iter()
-                          .filter(|pkt| pkt.seq_nr() > self.ack_nr + 1)
-                          .map(|pkt| (pkt.seq_nr() - self.ack_nr - 2) as usize)
-                          .map(|diff| (diff / 8, diff % 8));
-
-        let mut sack = Vec::new();
-        for (byte, bit) in stashed {
-            // Make sure the amount of elements in the SACK vector is a
-            // multiple of 4 and enough to represent the lost packets
-            while byte >= sack.len() || sack.len() % 4 != 0 {
-                sack.push(0u8);
-            }
-
-            sack[byte] |= 1 << bit;
-        }
-
-        sack
-    }
-
     /// Sends a fast resend request to the remote peer.
     ///
     /// A fast resend request consists of sending three State packets (acknowledging the last
@@ -1096,28 +1228,6 @@ impl UtpSocket {
             }
         }
         debug!("---> END resend_lost_packet <---");
-    }
-
-    /// Forgets sent packets that were acknowledged by the remote peer.
-    fn advance_send_window(&mut self) {
-        // The reason I'm not removing the first element in a loop while its sequence number is
-        // smaller than `last_acked` is because of wrapping sequence numbers, which would create the
-        // sequence [..., 65534, 65535, 0, 1, ...]. If `last_acked` is smaller than the first
-        // packet's sequence number because of wraparound (for instance, 1), no packets would be
-        // removed, as the condition `seq_nr < last_acked` would fail immediately.
-        //
-        // On the other hand, I can't keep removing the first packet in a loop until its sequence
-        // number matches `last_acked` because it might never match, and in that case no packets
-        // should be removed.
-        if let Some(position) = self.send_window
-                                    .iter()
-                                    .position(|pkt| pkt.seq_nr() == self.last_acked) {
-            for _ in 0..position + 1 {
-                let packet = self.send_window.remove(0);
-                self.curr_window -= packet.len() as u32;
-            }
-        }
-        debug!("self.curr_window: {}", self.curr_window);
     }
 
     /// Handles an incoming packet, updating socket state accordingly.
@@ -1243,78 +1353,6 @@ impl UtpSocket {
         }
     }
 
-    fn handle_data_packet(&mut self, packet: &Packet) -> Option<Packet> {
-        // If a FIN was previously sent, reply with a FIN packet acknowledging the received packet.
-        let packet_type = if self.state == SocketState::FinSent {
-            PacketType::Fin
-        } else {
-            PacketType::State
-        };
-        let mut reply = self.prepare_reply(packet, packet_type);
-
-        if packet.seq_nr().wrapping_sub(self.ack_nr) > 1 {
-            debug!("current ack_nr ({}) is behind received packet seq_nr ({})",
-                   self.ack_nr,
-                   packet.seq_nr());
-
-            // Set SACK extension payload if the packet is not in order
-            let sack = self.build_selective_ack();
-
-            if sack.len() > 0 {
-                reply.set_sack(sack);
-            }
-        }
-
-        Some(reply)
-    }
-
-    fn queuing_delay(&self) -> i64 {
-        let filtered_current_delay = self.filtered_current_delay();
-        let min_base_delay = self.min_base_delay();
-        let queuing_delay = filtered_current_delay - min_base_delay;
-
-        debug!("filtered_current_delay: {}", filtered_current_delay);
-        debug!("min_base_delay: {}", min_base_delay);
-        debug!("queuing_delay: {}", queuing_delay);
-
-        queuing_delay
-    }
-
-    /// Calculates the new congestion window size, increasing it or decreasing it.
-    ///
-    /// This is the core of uTP, the [LEDBAT][ledbat_rfc] congestion algorithm. It depends on
-    /// estimating the queuing delay between the two peers, and adjusting the congestion window
-    /// accordingly.
-    ///
-    /// `off_target` is a normalized value representing the difference between the current queuing
-    /// delay and a fixed target delay (`TARGET`). `off_target` ranges between -1.0 and 1.0. A
-    /// positive value makes the congestion window increase, while a negative value makes the
-    /// congestion window decrease.
-    ///
-    /// `bytes_newly_acked` is the number of bytes acknowledged by an inbound `State` packet. It may
-    /// be the size of the packet explicitly acknowledged by the inbound packet (i.e., with sequence
-    /// number equal to the inbound packet's acknowledgement number), or every packet implicitly
-    /// acknowledged (every packet with sequence number between the previous inbound `State`
-    /// packet's acknowledgement number and the current inbound `State` packet's acknowledgement
-    /// number).
-    ///
-    ///[ledbat_rfc]: https://tools.ietf.org/html/rfc6817
-    fn update_congestion_window(&mut self, off_target: f64, bytes_newly_acked: u32) {
-        let flightsize = self.curr_window;
-
-        let cwnd_increase = GAIN * off_target * bytes_newly_acked as f64 * MSS as f64;
-        let cwnd_increase = cwnd_increase / self.cwnd as f64;
-        debug!("cwnd_increase: {}", cwnd_increase);
-
-        self.cwnd = (self.cwnd as f64 + cwnd_increase) as u32;
-        let max_allowed_cwnd = flightsize + ALLOWED_INCREASE * MSS;
-        self.cwnd = min(self.cwnd, max_allowed_cwnd);
-        self.cwnd = max(self.cwnd, MIN_CWND * MSS);
-
-        debug!("cwnd: {}", self.cwnd);
-        debug!("max_allowed_cwnd: {}", max_allowed_cwnd);
-    }
-
     fn handle_state_packet(&mut self, packet: &Packet) {
         if packet.ack_nr() == self.last_acked {
             self.duplicate_ack_count += 1;
@@ -1399,29 +1437,6 @@ impl UtpSocket {
 
         // Success, advance send window
         self.advance_send_window();
-    }
-
-    /// Inserts a packet into the socket's buffer.
-    ///
-    /// The packet is inserted in such a way that the packets in the buffer are sorted according to
-    /// their sequence number in ascending order. This allows storing packets that were received out
-    /// of order.
-    ///
-    /// Trying to insert a duplicate of a packet will silently fail.
-    /// it's more recent (larger timestamp).
-    fn insert_into_buffer(&mut self, packet: Packet) {
-        // Immediately push to the end if the packet's sequence number comes after the last
-        // packet's.
-        if self.incoming_buffer.last().map(|p| packet.seq_nr() > p.seq_nr()).unwrap_or(false) {
-            self.incoming_buffer.push(packet);
-        } else {
-            // Find index following the most recent packet before the one we wish to insert
-            let i = self.incoming_buffer.iter().filter(|p| p.seq_nr() < packet.seq_nr()).count();
-
-            if self.incoming_buffer.get(i).map(|p| p.seq_nr() != packet.seq_nr()).unwrap_or(true) {
-                self.incoming_buffer.insert(i, packet);
-            }
-        }
     }
 }
 
