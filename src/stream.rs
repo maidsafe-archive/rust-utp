@@ -71,6 +71,14 @@ impl UtpStream {
     pub fn send_keepalive(&self) {
         self.socket.send_keepalive();
     }
+
+    /// Try to clone the stream, creating two handles to the same stream that can be used
+    /// concurrently.
+    pub fn try_clone(&self) -> Result<UtpStream> {
+        Ok(UtpStream {
+            socket: try!(self.socket.try_clone()),
+        })
+    }
 }
 
 impl Read for UtpStream {

@@ -1262,6 +1262,15 @@ impl UtpSocket {
         }
     }
 
+    /// Try and clone the UtpSocket, creating two handles to the same socket that can be used
+    /// concurrently.
+    pub fn try_clone(&self) -> Result<UtpSocket> {
+        Ok(UtpSocket {
+            socket: try!(self.socket.try_clone()),
+            inner: self.inner.clone(),
+        })
+    }
+
     /// Sends every packet in the unsent packet queue.
     fn send(&mut self) -> Result<()> {
         loop {
