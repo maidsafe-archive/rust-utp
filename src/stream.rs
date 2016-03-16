@@ -64,12 +64,20 @@ impl UtpStream {
 
     /// Changes the maximum number of retransmission retries on the underlying socket.
     pub fn set_max_retransmission_retries(&mut self, n: u32) {
-        self.socket.max_retransmission_retries = n;
+        self.socket.set_max_retransmission_retries(n);
     }
 
     /// Try to send a keepalive packet to the peer, ensuring the connection stays active.
     pub fn send_keepalive(&self) {
         self.socket.send_keepalive();
+    }
+
+    /// Try to clone the stream, creating two handles to the same stream that can be used
+    /// concurrently.
+    pub fn try_clone(&self) -> Result<UtpStream> {
+        Ok(UtpStream {
+            socket: try!(self.socket.try_clone()),
+        })
     }
 }
 

@@ -2,6 +2,7 @@ use std::cmp::{min, max};
 use std::collections::VecDeque;
 use std::net::{ToSocketAddrs, SocketAddr, UdpSocket};
 use std::io::{Result, Error, ErrorKind};
+use std::sync::{Arc, Mutex};
 use util::{now_microseconds, ewma, Sequence};
 use packet::{Packet, PacketType, Encodable, Decodable, ExtensionType, HEADER_SIZE};
 use rand::{self, Rng};
@@ -95,40 +96,10 @@ fn unsafe_copy(src: &[u8], dst: &mut [u8]) -> usize {
     max_len
 }
 
-/// A structure that represents a uTP (Micro Transport Protocol) connection between a local socket
-/// and a remote socket.
-///
-/// The socket will be closed when the value is dropped (either explicitly or when it goes out of
-/// scope).
-///
-/// The default maximum retransmission retries is 5, which translates to about 16 seconds. It can be
-/// changed by assigning the desired maximum retransmission retries to a socket's
-/// `max_retransmission_retries` field. Notice that the initial congestion timeout is 500 ms and
-/// doubles with each timeout.
-///
-/// # Examples
-///
-/// ```no_run
-/// use utp::UtpSocket;
-///
-/// let mut socket = UtpSocket::bind("127.0.0.1:1234").expect("Error binding socket");
-///
-/// let mut buf = [0; 1000];
-/// let (amt, _src) = socket.recv_from(&mut buf).expect("Error receiving");
-///
-/// let mut buf = &mut buf[..amt];
-/// buf.reverse();
-/// let _ = socket.send_to(buf).expect("Error sending");
-///
-/// // Close the socket. You can either call `close` on the socket,
-/// // explicitly drop it or just let it go out of scope.
-/// socket.close();
-/// ```
-pub struct UtpSocket {
-    /// The wrapped UDP socket
-    socket: UdpSocket,
-
-    /// Remote peer
+/// Stores the internal state of a `UtpSocket`. This can be shared between many `UtpSocket`s using
+/// the `try_clone` method.
+struct UtpSocketInner {
+    /// The address of the remote peer the socket is connected to.
     connected_to: SocketAddr,
 
     /// Sender connection identifier
@@ -205,7 +176,7 @@ pub struct UtpSocket {
     cwnd: u32,
 
     /// Maximum retransmission retries
-    pub max_retransmission_retries: u32,
+    max_retransmission_retries: u32,
 
     /// Used by `set_read_timeout`.
     user_read_timeout: u64,
@@ -220,568 +191,8 @@ pub struct UtpSocket {
     state_packet: Option<Packet>,
 }
 
-impl UtpSocket {
-    /// Creates a new UTP socket from the given UDP socket and the remote peer's address.
-    ///
-    /// The connection identifier of the resulting socket is randomly generated.
-    fn from_raw_parts(s: UdpSocket, src: SocketAddr) -> UtpSocket {
-        // Safely generate the two sequential connection identifiers.
-        // This avoids an overflow when the generated receiver identifier is the largest
-        // representable value in u16 and it is incremented to yield the corresponding sender
-        // identifier.
-        let (receiver_id, sender_id) =
-            || -> (u16, u16) {
-                let mut rng = rand::thread_rng();
-                loop {
-                    let id = rng.gen::<u16>();
-                    if id.checked_add(1).is_some() {
-                        return (id, id + 1);
-                    }
-                }
-            }();
-
-        UtpSocket {
-            socket: s,
-            connected_to: src,
-            receiver_connection_id: receiver_id,
-            sender_connection_id: sender_id,
-            seq_nr: 1,
-            ack_nr: 0,
-            state: SocketState::New,
-            incoming_buffer: Vec::new(),
-            send_window: Vec::new(),
-            unsent_queue: VecDeque::new(),
-            duplicate_ack_count: 0,
-            last_acked: 0,
-            last_acked_timestamp: 0,
-            last_dropped: 0,
-            rtt: 0,
-            rtt_variance: 0,
-            read_ready_data: VecDeque::new(),
-            pending_data: VecDeque::new(),
-            curr_window: 0,
-            remote_wnd_size: 0,
-            current_delays: Vec::new(),
-            base_delays: VecDeque::with_capacity(BASE_HISTORY),
-            their_delay: 0,
-            last_rollover: 0,
-            congestion_timeout: INITIAL_CONGESTION_TIMEOUT,
-            cwnd: INIT_CWND * MSS,
-            max_retransmission_retries: MAX_RETRANSMISSION_RETRIES,
-            user_read_timeout: 0,
-            last_congestion_update: SteadyTime::now(),
-            retries: 0,
-            state_packet: None,
-        }
-    }
-
-    /// Creates a new UTP socket from the given UDP socket.
-    pub fn bind_with_udp_socket(socket: UdpSocket) -> Result<UtpSocket> {
-        socket.local_addr().map(|a| UtpSocket::from_raw_parts(socket, a))
-    }
-
-    /// Creates a new UTP socket from the given address.
-    ///
-    /// The address type can be any implementer of the `ToSocketAddr` trait. See its documentation
-    /// for concrete examples.
-    ///
-    /// If more than one valid address is specified, only the first will be used.
-    pub fn bind<A: ToSocketAddrs>(addr: A) -> Result<UtpSocket> {
-        take_address(addr).and_then(|a| UdpSocket::bind(a).map(|s| UtpSocket::from_raw_parts(s, a)))
-    }
-
-    /// Returns the socket address that this socket was created from.
-    pub fn local_addr(&self) -> Result<SocketAddr> {
-        self.socket.local_addr()
-    }
-
-    /// Returns the socket address of the remote peer of this UTP connection.
-    pub fn peer_addr(&self) -> Result<SocketAddr> {
-        if self.state == SocketState::Connected || self.state == SocketState::FinSent {
-            Ok(self.connected_to)
-        } else {
-            Err(Error::from(SocketError::NotConnected))
-        }
-    }
-
-    /// Opens a connection to a remote host by hostname or IP address.
-    ///
-    /// The address type can be any implementer of the `ToSocketAddr` trait. See its documentation
-    /// for concrete examples.
-    ///
-    /// If more than one valid address is specified, only the first will be used.
-    pub fn connect<A: ToSocketAddrs>(other: A) -> Result<UtpSocket> {
-        let addr = try!(take_address(other));
-        let my_addr = match addr {
-            SocketAddr::V4(_) => "0.0.0.0:0",
-            SocketAddr::V6(_) => ":::0",
-        };
-        let mut socket = try!(UtpSocket::bind(my_addr));
-        socket.connected_to = addr;
-
-        let mut packet = Packet::new();
-        packet.set_type(PacketType::Syn);
-        packet.set_connection_id(socket.receiver_connection_id);
-        packet.set_seq_nr(socket.seq_nr);
-
-        let mut buf = [0; BUF_SIZE];
-        let mut syn_timeout = socket.congestion_timeout;
-        let mut syn_retries = 0;
-
-        while syn_retries < MAX_SYN_RETRIES {
-            packet.set_timestamp_microseconds(now_microseconds());
-
-            // Send packet
-            debug!("Connecting to {}", socket.connected_to);
-            try!(socket.socket.send_to(&packet.to_bytes()[..], socket.connected_to));
-            socket.state = SocketState::SynSent;
-            debug!("sent {:?}", packet);
-
-            // Validate response
-            socket.socket
-                  .set_read_timeout(Some(Duration::from_millis(syn_timeout)))
-                  .expect("Error setting read timeout");
-            match socket.socket.recv_from(&mut buf) {
-                Ok((read, addr)) => {
-                    let packet = try!(Packet::from_bytes(&buf[..read]).or(Err(SocketError::InvalidPacket)));
-
-                    socket.connected_to = addr;
-
-                    if packet.get_type() != PacketType::State {
-                        // The network might have dropped the `State` packet
-                        // from the peer, so we need to ask for it again.
-                        syn_retries += 1;
-                        continue;
-                    }
-
-                    try!(socket.handle_packet(&packet, addr));
-
-                    return Ok(socket);
-                },
-                Err(ref e) if (e.kind() == ErrorKind::WouldBlock ||
-                               e.kind() == ErrorKind::TimedOut) => {
-                    debug!("Timed out, retrying");
-                    syn_timeout *= 2;
-                    syn_retries += 1;
-                    continue;
-                }
-                Err(e) => return Err(e),
-            };
-        }
-
-        Err(Error::from(SocketError::ConnectionTimedOut))
-    }
-
-    /// If you have already prepared UDP sockets at each end (e.g. you're doing
-    /// hole punching), then the rendezvous connection setup is your choice.
-    ///
-    /// Rendezvous connection will only use the specified socket and addresses,
-    /// but each end must call `rendezvous_connect` itself.
-    ///
-    /// This is an unofficial extension to the uTP protocol. Both peers will try
-    /// to act as initiator and acceptor sockets. Then, the connection id which
-    /// is numerically lower decides which end will assume which role (initiator
-    /// or acceptor).
-    pub fn rendezvous_connect<A: ToSocketAddrs>(udp_socket: UdpSocket,
-                                                other: A)
-                                                -> Result<UtpSocket> {
-        let addr = try!(take_address(other));
-        let mut socket = try!(UtpSocket::bind_with_udp_socket(udp_socket));
-        socket.rendezvous_connect_to(addr).map(|_| socket)
-    }
-
-    fn rendezvous_connect_to(&mut self, addr: SocketAddr) -> Result<()> {
-        self.connected_to = addr;
-
-        let mut packet = Packet::new();
-        packet.set_type(PacketType::Syn);
-        packet.set_connection_id(self.receiver_connection_id);
-        packet.set_seq_nr(self.seq_nr);
-
-        let mut buf = [0; BUF_SIZE];
-
-        let mut syn_timeout = self.congestion_timeout;
-        let mut retry_count = 0;
-
-        let mut rx_syn: Option<Packet> = None;
-        let mut rx_state: Option<Packet> = None;
-
-        while retry_count < MAX_SYN_RETRIES {
-            packet.set_timestamp_microseconds(now_microseconds());
-
-            // Send packet
-            debug!("Connecting to {}", self.connected_to);
-            try!(self.socket.send_to(&packet.to_bytes()[..], self.connected_to));
-            self.state = SocketState::SynSent;
-            debug!("sent {:?}", packet);
-
-            try!(self.socket.set_read_timeout(Some(Duration::from_millis(syn_timeout))));
-
-            // Validate response
-            match self.socket.recv_from(&mut buf) {
-                Ok((read, src)) => {
-                    let mut packet = match Packet::from_bytes(&buf[..read]) {
-                        Ok(packet) => packet,
-                        Err(_) => {
-                            continue;
-                        }
-                    };
-
-                    let cid = min(self.receiver_connection_id, packet.connection_id());
-
-                    packet.set_connection_id(cid);
-
-                    // Would be nicer to handle this in the handle_packet
-                    // function, but we'd need to add new socket state
-                    // not to interfere with SocketState::New and
-                    // SocketState::SynSent states.
-                    match packet.get_type() {
-                        PacketType::Syn => {
-                            self.receiver_connection_id = cid;
-                            self.sender_connection_id = cid + 1;
-
-                            let reply = self.prepare_reply(&packet, PacketType::State);
-                            try!(self.socket.send_to(&reply.to_bytes()[..], self.connected_to));
-
-                            rx_syn = Some(packet);
-                        }
-                        PacketType::State => {
-                            self.receiver_connection_id = cid;
-                            self.sender_connection_id = cid + 1;
-
-                            rx_state = Some(packet);
-                        }
-                        _ => continue,
-                    }
-
-                    match (&rx_syn, &rx_state) {
-                        (&Some(ref _syn), &Some(ref state)) => {
-                            try!(self.handle_packet(state, src));
-                            return Ok(());
-                        }
-                        _ => continue,
-                    }
-                }
-                Err(ref e) if (e.kind() == ErrorKind::WouldBlock ||
-                               e.kind() == ErrorKind::TimedOut) => {
-                    debug!("Timed out, retrying");
-                    syn_timeout *= 2;
-                    retry_count += 1;
-                    continue;
-                }
-                Err(e) => return Err(e),
-            };
-        }
-
-        Err(Error::from(SocketError::ConnectionTimedOut))
-    }
-
-    /// Gracefully closes connection to peer.
-    ///
-    /// This method allows both peers to receive all packets still in
-    /// flight.
-    pub fn close(&mut self) -> Result<()> {
-        // Nothing to do if the socket's already closed or not connected
-        if self.state == SocketState::Closed || self.state == SocketState::New ||
-           self.state == SocketState::SynSent {
-            return Ok(());
-        }
-
-        // Flush unsent and unacknowledged packets
-        try!(self.flush());
-
-        let mut packet = Packet::new();
-        packet.set_connection_id(self.sender_connection_id);
-        packet.set_seq_nr(self.seq_nr);
-        packet.set_ack_nr(self.ack_nr);
-        packet.set_timestamp_microseconds(now_microseconds());
-        packet.set_type(PacketType::Fin);
-
-        // Send FIN
-        try!(self.socket.send_to(&packet.to_bytes()[..], self.connected_to));
-        debug!("sent {:?}", packet);
-        self.state = SocketState::FinSent;
-
-        // Receive JAKE
-        let mut buf = [0; BUF_SIZE];
-        while self.state != SocketState::Closed {
-            try!(self.recv(&mut buf, false));
-        }
-
-        Ok(())
-    }
-
-    /// Receives data from socket.
-    ///
-    /// On success, returns the number of bytes read and the sender's address.
-    /// Returns 0 bytes read after receiving a FIN packet when the remaining
-    /// in-flight packets are consumed.
-    pub fn recv_from(&mut self, buf: &mut [u8]) -> Result<(usize, SocketAddr)> {
-        let read = {
-            let (read_ready_0, read_ready_1) = self.read_ready_data.as_slices();
-            let mut read = 0;
-            if read_ready_0.len() > 0 {
-                read = unsafe_copy(read_ready_0, buf)
-            }
-            if read_ready_1.len() > 0 {
-                read += unsafe_copy(read_ready_1, &mut buf[read..])
-            }
-            read
-        };
-        if read > 0 {
-            self.read_ready_data.drain(..read);
-            return Ok((read, self.connected_to));
-        }
-
-        let read = self.flush_incoming_buffer(buf);
-
-        if read > 0 {
-            Ok((read, self.connected_to))
-        } else {
-            // If the socket received a reset packet and all data has been flushed, then it can't
-            // receive anything else
-            if self.state == SocketState::ResetReceived {
-                return Err(Error::from(SocketError::ConnectionReset));
-            }
-
-            loop {
-                // A closed socket with no pending data can only "read" 0 new bytes.
-                if self.state == SocketState::Closed {
-                    return Ok((0, self.connected_to));
-                }
-
-                match self.recv(buf, true) {
-                    Ok((0, _src)) => continue,
-                    Ok(x) => return Ok(x),
-                    Err(e) => return Err(e),
-                }
-            }
-        }
-    }
-
-    /// Changes read operations to block for at most the specified number of
-    /// milliseconds.
-    pub fn set_read_timeout(&mut self, user_timeout: Option<u64>) {
-        self.user_read_timeout = match user_timeout {
-            Some(t) => {
-                if t > 0 {
-                    t
-                } else {
-                    0
-                }
-            }
-            None => 0,
-        }
-    }
-
-    #[cfg(windows)]
-    fn ignore_udp_error(e: &Error) -> bool {
-        // On Windows, the recv_from operation on the UDP socket may return the
-        // following errors, which are expected and should be ignored:
-        //
-        // - 10054 (WSAECONNRESET): Windows can send this error if a previous
-        //   send operation resulted in an ICMP Port Unreachable. And if it's a
-        //   loopback interface, it can know whether there is already another
-        //   end to communicate.
-        // - 10040 (WSAEMSGSIZE): This error was randomly appearing in a test
-        //   that I conducted. Not really sure why it's happening. The frequency
-        //   decreased when I increased the receive buffer size, but it was not
-        //   important to get a network up and running.
-        //
-        // Without these changes, it was impossible to get a relatively large
-        // network running without issues. By large I mean a test that might be
-        // too bursting for a single machine to run.
-        //
-        // More references:
-        //
-        // - http://stackoverflow.com/questions/30749423/is-winsock-error-10054-wsaeconnreset-normal-with-udp-to-from-localhost#comment49588739_30749423
-        // - https://github.com/maidsafe/crust/pull/454
-        const WSAECONNRESET: i32 = 10054;
-        const WSAEMSGSIZE: i32 = 10040;
-        match e.raw_os_error() {
-            Some(e) => match e {
-                WSAECONNRESET | WSAEMSGSIZE => true,
-                _ => false,
-            },
-            None => false,
-        }
-    }
-
-    #[cfg(not(windows))]
-    fn ignore_udp_error(_: &Error) -> bool {
-        false
-    }
-
-    fn recv(&mut self, buf: &mut [u8], use_user_timeout: bool) -> Result<(usize, SocketAddr)> {
-        let mut b = [0; BUF_SIZE + HEADER_SIZE];
-        let now = SteadyTime::now();
-        let (read, src);
-        let user_timeout = if use_user_timeout {
-            self.user_read_timeout
-        } else {
-            0
-        };
-        let use_user_timeout = user_timeout != 0;
-
-        // Try to receive a packet and handle timeouts
-        loop {
-            // Abort loop if the current try exceeds the maximum number of retransmission retries.
-            if self.retries >= self.max_retransmission_retries {
-                debug!("exceeds max_retransmission_retries : {} ; current connect state is : {:?}",
-                       self.max_retransmission_retries,
-                       self.state);
-                self.state = SocketState::Closed;
-                debug!("socket marked as closed from {:?} to {:?}",
-                       self.local_addr(),
-                       self.connected_to);
-                return Err(Error::from(SocketError::ConnectionTimedOut));
-            }
-
-            let timeout;
-            let congestion_timeout = if self.state != SocketState::New {
-                debug!("setting read timeout of {} ms", self.congestion_timeout);
-                Some(Duration::from_millis(self.congestion_timeout))
-            } else {
-                None
-            };
-            {
-                let user_timeout = Duration::from_millis(user_timeout);
-                timeout = if use_user_timeout {
-                    match congestion_timeout {
-                        Some(congestion_timeout) => {
-                            use std::cmp::min;
-                            Some(min(congestion_timeout, user_timeout))
-                        }
-                        None => Some(user_timeout),
-                    }
-                } else {
-                    congestion_timeout
-                };
-            }
-
-            if use_user_timeout {
-                let user_timeout = time::Duration::milliseconds(user_timeout as i64);
-                if (SteadyTime::now() - now) >= user_timeout {
-                    return Err(Error::from(SocketError::UserTimedOut));
-                }
-            }
-
-            self.socket.set_read_timeout(timeout).expect("Error setting read timeout");
-            match self.socket.recv_from(&mut b) {
-                Ok((r, s)) => {
-                    read = r;
-                    src = s;
-                    break;
-                }
-                Err(ref e) if (e.kind() == ErrorKind::WouldBlock ||
-                               e.kind() == ErrorKind::TimedOut) => {
-                    debug!("recv_from timed out");
-                    let now = SteadyTime::now();
-                    let congestion_timeout = {
-                        time::Duration::milliseconds(self.congestion_timeout as i64)
-                    };
-                    if !use_user_timeout ||
-                       ((now - self.last_congestion_update) >= congestion_timeout) {
-                        self.last_congestion_update = now;
-                        try!(self.handle_receive_timeout());
-                        self.retries += 1;
-                    }
-                }
-                Err(ref e) if Self::ignore_udp_error(e) => (),
-                Err(e) => return Err(e),
-            };
-
-            let elapsed = (SteadyTime::now() - now).num_milliseconds();
-            debug!("{} ms elapsed", elapsed);
-        }
-
-        self.last_congestion_update = SteadyTime::now();
-        self.retries = 0;
-
-        // Decode received data into a packet
-        let packet = match Packet::from_bytes(&b[..read]) {
-            Ok(packet) => packet,
-            Err(e) => {
-                debug!("{}", e);
-                debug!("Ignoring invalid packet");
-                return Ok((0, self.connected_to));
-            }
-        };
-        debug!("received {:?}", packet);
-
-        // Process packet, including sending a reply if necessary
-        if let Some(mut pkt) = try!(self.handle_packet(&packet, src)) {
-            pkt.set_wnd_size(BUF_SIZE as u32);
-            try!(self.socket.send_to(&pkt.to_bytes()[..], src));
-            debug!("sent {:?}", pkt);
-        }
-
-        // Insert data packet into the incoming buffer if it isn't a duplicate of a previously
-        // discarded packet
-        if packet.get_type() == PacketType::Data {
-            if Sequence::less(self.last_dropped, packet.seq_nr()) {
-                self.insert_into_buffer(packet);
-            }
-        }
-
-        // Flush incoming buffer if possible
-        let read = self.flush_incoming_buffer(buf);
-
-        Ok((read, src))
-    }
-
-    fn handle_receive_timeout(&mut self) -> Result<()> {
-        self.congestion_timeout *= 2;
-        self.cwnd = MSS;
-
-        // There are three possible cases here:
-        //
-        // - If the socket is sending and waiting for acknowledgements (the send window is
-        //   not empty), resend the first unacknowledged packet;
-        //
-        // - If the socket is not sending and it hasn't sent a FIN yet, then it's waiting
-        //   for incoming packets: send a fast resend request;
-        //
-        // - If the socket sent a FIN previously, resend it.
-        debug!("self.send_window: {:?}",
-               self.send_window
-                   .iter()
-                   .map(Packet::seq_nr)
-                   .collect::<Vec<u16>>());
-
-        if self.send_window.is_empty() {
-            // The socket is trying to close, all sent packets were acknowledged, and it has
-            // already sent a FIN: resend it.
-            if self.state == SocketState::FinSent {
-                let mut packet = Packet::new();
-                packet.set_connection_id(self.sender_connection_id);
-                packet.set_seq_nr(self.seq_nr);
-                packet.set_ack_nr(self.ack_nr);
-                packet.set_timestamp_microseconds(now_microseconds());
-                packet.set_type(PacketType::Fin);
-
-                // Send FIN
-                try!(self.socket.send_to(&packet.to_bytes()[..], self.connected_to));
-                debug!("resent FIN: {:?}", packet);
-            } else if self.state != SocketState::New {
-                // The socket is waiting for incoming packets but the remote peer is silent:
-                // send a fast resend request.
-                debug!("sending fast resend request");
-                self.send_fast_resend_request();
-            }
-        } else {
-            // The socket is sending data packets but there is no reply from the remote
-            // peer: resend the first unacknowledged packet with the current timestamp.
-            let mut packet = &mut self.send_window[0];
-            packet.set_timestamp_microseconds(now_microseconds());
-            try!(self.socket.send_to(&packet.to_bytes()[..], self.connected_to));
-            debug!("resent {:?}", packet);
-        }
-
-        Ok(())
-    }
-
-    fn prepare_reply(&self, original: &Packet, t: PacketType) -> Packet {
+impl UtpSocketInner {
+    pub fn prepare_reply(&self, original: &Packet, t: PacketType) -> Packet {
         let mut resp = Packet::new();
         resp.set_type(t);
         let self_t_micro: u32 = now_microseconds();
@@ -796,7 +207,7 @@ impl UtpSocket {
     }
 
     /// Removes a packet in the incoming buffer and updates the current acknowledgement number.
-    fn advance_incoming_buffer(&mut self) -> Option<Packet> {
+    pub fn advance_incoming_buffer(&mut self) -> Option<Packet> {
         if !self.incoming_buffer.is_empty() {
             let packet = self.incoming_buffer.remove(0);
             debug!("Removed packet from incoming buffer: {:?}", packet);
@@ -854,127 +265,6 @@ impl UtpSocket {
         }
 
         0
-    }
-
-    /// Sends data on the socket to the remote peer. On success, returns the number of bytes
-    /// written.
-    //
-    // # Implementation details
-    //
-    // This method inserts packets into the send buffer and keeps trying to
-    // advance the send window until an ACK corresponding to the last packet is
-    // received.
-    //
-    // Note that the buffer passed to `send_to` might exceed the maximum packet
-    // size, which will result in the data being split over several packets.
-    pub fn send_to(&mut self, buf: &[u8]) -> Result<usize> {
-        if self.state == SocketState::Closed {
-            return Err(Error::from(SocketError::ConnectionClosed));
-        }
-
-        let total_length = buf.len();
-
-        for chunk in buf.chunks(MSS as usize - HEADER_SIZE) {
-            let mut packet = Packet::with_payload(chunk);
-            packet.set_seq_nr(self.seq_nr);
-            packet.set_ack_nr(self.ack_nr);
-            packet.set_connection_id(self.sender_connection_id);
-
-            self.unsent_queue.push_back(packet);
-
-            // `OverflowingOps` is marked unstable, so we can't use `overflowing_add` here
-            if self.seq_nr == ::std::u16::MAX {
-                self.seq_nr = 0;
-            } else {
-                self.seq_nr += 1;
-            }
-        }
-
-        // Send every packet in the queue
-        try!(self.send());
-
-        Ok(total_length)
-    }
-
-    /// Consumes acknowledgements for every pending packet.
-    pub fn flush(&mut self) -> Result<()> {
-        let mut buf = [0u8; BUF_SIZE];
-        while !self.send_window.is_empty() {
-            debug!("packets in send window: {}", self.send_window.len());
-            try!(self.recv(&mut buf, false));
-        }
-
-        Ok(())
-    }
-
-    fn send_state(&self) {
-        let mut packet = Packet::new();
-        packet.set_type(PacketType::State);
-        let self_t_micro: u32 = now_microseconds();
-        packet.set_timestamp_microseconds(self_t_micro);
-        packet.set_timestamp_difference_microseconds(self.their_delay);
-        packet.set_connection_id(self.sender_connection_id);
-        packet.set_seq_nr(self.seq_nr);
-        packet.set_ack_nr(self.ack_nr);
-        let _ = self.socket.send_to(&packet.to_bytes()[..], self.connected_to);
-    }
-
-    /// Send a keepalive packet on the stream.
-    pub fn send_keepalive(&self) {
-        if now_microseconds().wrapping_sub(self.last_acked_timestamp) > 14_000_000 {
-            self.send_state();
-        }
-    }
-
-    /// Sends every packet in the unsent packet queue.
-    fn send(&mut self) -> Result<()> {
-        while let Some(mut packet) = self.unsent_queue.pop_front() {
-            try!(self.send_packet(&mut packet));
-            self.curr_window += packet.len() as u32;
-            self.send_window.push(packet);
-        }
-        Ok(())
-    }
-
-    /// Send one packet.
-    #[inline]
-    fn send_packet(&mut self, packet: &mut Packet) -> Result<()> {
-        debug!("current window: {}", self.send_window.len());
-        let max_inflight = min(self.cwnd, self.remote_wnd_size);
-        let max_inflight = max(MIN_CWND * MSS, max_inflight);
-        let now = now_microseconds();
-
-        // Wait until enough in-flight packets are acknowledged for rate control purposes, but don't
-        // wait more than 500 ms (PRE_SEND_TIMEOUT) before sending the packet.
-        while self.curr_window >= max_inflight && now_microseconds() - now < PRE_SEND_TIMEOUT {
-            debug!("self.curr_window: {}", self.curr_window);
-            debug!("max_inflight: {}", max_inflight);
-            debug!("self.duplicate_ack_count: {}", self.duplicate_ack_count);
-            debug!("now_microseconds() - now = {}", now_microseconds() - now);
-            let mut buf = [0; BUF_SIZE];
-            let (read, _) = try!(self.recv(&mut buf, false));
-            self.read_ready_data.extend(&buf[..read]);
-        }
-        debug!("out: now_microseconds() - now = {}",
-               now_microseconds() - now);
-
-        // Check if it still makes sense to send packet, as we might be trying to resend a lost
-        // packet acknowledged in the receive loop above.
-        // If there were no wrapping around of sequence numbers, we'd simply check if the packet's
-        // sequence number is greater than `last_acked`.
-        let distance_a = packet.seq_nr().wrapping_sub(self.last_acked);
-        let distance_b = self.last_acked.wrapping_sub(packet.seq_nr());
-        if distance_a > distance_b {
-            debug!("Packet already acknowledged, skipping...");
-            return Ok(());
-        }
-
-        packet.set_timestamp_microseconds(now_microseconds());
-        packet.set_timestamp_difference_microseconds(self.their_delay);
-        try!(self.socket.send_to(&packet.to_bytes()[..], self.connected_to));
-        debug!("sent {:?}", packet);
-
-        Ok(())
     }
 
     // Insert a new sample in the base delay list.
@@ -1070,34 +360,6 @@ impl UtpSocket {
         sack
     }
 
-    /// Sends a fast resend request to the remote peer.
-    ///
-    /// A fast resend request consists of sending three State packets (acknowledging the last
-    /// received packet) in quick succession.
-    fn send_fast_resend_request(&self) {
-        for _ in 0..3 {
-            self.send_state();
-        }
-    }
-
-    fn resend_lost_packet(&mut self, lost_packet_nr: u16) {
-        debug!("---> resend_lost_packet({}) <---", lost_packet_nr);
-        match self.send_window.iter().position(|pkt| pkt.seq_nr() == lost_packet_nr) {
-            None => debug!("Packet {} not found", lost_packet_nr),
-            Some(position) => {
-                debug!("self.send_window.len(): {}", self.send_window.len());
-                debug!("position: {}", position);
-                let mut packet = self.send_window[position].clone();
-                // FIXME: Unchecked result
-                let _ = self.send_packet(&mut packet);
-
-                // We intentionally don't increase `curr_window` because otherwise a packet's length
-                // would be counted more than once
-            }
-        }
-        debug!("---> END resend_lost_packet <---");
-    }
-
     /// Forgets sent packets that were acknowledged by the remote peer.
     fn advance_send_window(&mut self) {
         // The reason I'm not removing the first element in a loop while its sequence number is
@@ -1118,129 +380,6 @@ impl UtpSocket {
             }
         }
         debug!("self.curr_window: {}", self.curr_window);
-    }
-
-    /// Handles an incoming packet, updating socket state accordingly.
-    ///
-    /// Returns the appropriate reply packet, if needed.
-    fn handle_packet(&mut self, packet: &Packet, src: SocketAddr) -> Result<Option<Packet>> {
-        debug!("({:?}, {:?})", self.state, packet.get_type());
-
-        let is_data_or_fin = packet.get_type() == PacketType::Data
-                          || packet.get_type() == PacketType::Fin;
-
-        // Acknowledge only if the packet strictly follows the previous one
-        // and only if it is a payload packet. The restriction on PacketType
-        // is due to all other (non Data) packets are assigned seq_nr the
-        // same as the next Data packet, thus we could acknowledge what
-        // we have not received yet.
-        if is_data_or_fin && packet.seq_nr().wrapping_sub(self.ack_nr) == 1 {
-            self.ack_nr = packet.seq_nr();
-        }
-
-        // Reset connection if connection id doesn't match and this isn't a SYN
-        if packet.get_type() != PacketType::Syn && self.state != SocketState::SynSent &&
-           !(packet.connection_id() == self.sender_connection_id ||
-             packet.connection_id() == self.receiver_connection_id) {
-            return Ok(Some(self.prepare_reply(packet, PacketType::Reset)));
-        }
-
-        // Update remote window size
-        self.remote_wnd_size = packet.wnd_size();
-        debug!("self.remote_wnd_size: {}", self.remote_wnd_size);
-
-        // Update remote peer's delay between them sending the packet and us receiving it
-        let now = now_microseconds();
-        self.their_delay = now.wrapping_sub(packet.timestamp_microseconds());
-        debug!("self.their_delay: {}", self.their_delay);
-
-        match (self.state, packet.get_type()) {
-            (SocketState::New, PacketType::Syn) => {
-                self.connected_to = src;
-                self.ack_nr = packet.seq_nr();
-                self.seq_nr = rand::random();
-                self.last_acked = self.seq_nr.wrapping_sub(1);
-                self.receiver_connection_id = packet.connection_id() + 1;
-                self.sender_connection_id = packet.connection_id();
-                self.state = SocketState::Connected;
-                self.last_dropped = self.ack_nr;
-
-                self.state_packet = Some(self.prepare_reply(packet, PacketType::State));
-
-                // Advance the self.seq_nr (the sequence number of the next packet),
-                // this is because the other end will use the `seq_nr` of this state
-                // packet as his `self.last_acked`
-                self.seq_nr = self.seq_nr.wrapping_add(1);
-
-                Ok(self.state_packet.clone())
-            }
-            (SocketState::Connected, PacketType::Syn) if self.connected_to == src => {
-                // The other end might have sent another Syn packet because
-                // a reply to the first one did not arrive within a timeout
-                // caused by network congestion.
-                Ok(self.state_packet.clone())
-            }
-            (_, PacketType::Syn) => {
-                Ok(Some(self.prepare_reply(packet, PacketType::Reset)))
-            }
-            (SocketState::SynSent, PacketType::State) => {
-                self.connected_to = src;
-                self.ack_nr = packet.seq_nr();
-                self.seq_nr += 1;
-                self.state = SocketState::Connected;
-                self.last_acked = packet.ack_nr();
-                self.last_dropped = packet.seq_nr();
-                self.last_acked_timestamp = now_microseconds();
-                Ok(None)
-            }
-            (SocketState::SynSent, _) => Err(Error::from(SocketError::InvalidReply)),
-            (SocketState::Connected, PacketType::Data) |
-            (SocketState::FinSent, PacketType::Data) => Ok(self.handle_data_packet(packet)),
-            (SocketState::Connected, PacketType::State) => {
-                self.handle_state_packet(packet);
-                Ok(None)
-            }
-            (SocketState::Connected, PacketType::Fin) |
-            (SocketState::FinSent, PacketType::Fin) => {
-                if packet.ack_nr() < self.seq_nr {
-                    debug!("FIN received but there are missing acknowledgements for sent packets");
-                }
-                let mut reply = self.prepare_reply(packet, PacketType::State);
-                if packet.seq_nr().wrapping_sub(self.ack_nr) > 1 {
-                    debug!("current ack_nr ({}) is behind received packet seq_nr ({})",
-                           self.ack_nr,
-                           packet.seq_nr());
-
-                    // Set SACK extension payload if the packet is not in order
-                    let sack = self.build_selective_ack();
-
-                    if sack.len() > 0 {
-                        reply.set_sack(sack);
-                    }
-                }
-
-                // Give up, the remote peer might not care about our missing packets
-                self.state = SocketState::Closed;
-                Ok(Some(reply))
-            }
-            (SocketState::FinSent, PacketType::State) => {
-                if packet.ack_nr() == self.seq_nr {
-                    self.state = SocketState::Closed;
-                } else {
-                    self.handle_state_packet(packet);
-                }
-                Ok(None)
-            }
-            (_, PacketType::Reset) => {
-                self.state = SocketState::ResetReceived;
-                Err(Error::from(SocketError::ConnectionReset))
-            }
-            (state, ty) => {
-                let message = format!("Unimplemented handling for ({:?},{:?})", state, ty);
-                debug!("{}", message);
-                Err(Error::new(ErrorKind::Other, message))
-            }
-        }
     }
 
     fn handle_data_packet(&mut self, packet: &Packet) -> Option<Packet> {
@@ -1315,92 +454,6 @@ impl UtpSocket {
         debug!("max_allowed_cwnd: {}", max_allowed_cwnd);
     }
 
-    fn handle_state_packet(&mut self, packet: &Packet) {
-        if packet.ack_nr() == self.last_acked {
-            self.duplicate_ack_count += 1;
-        } else {
-            self.last_acked = packet.ack_nr();
-            self.last_acked_timestamp = now_microseconds();
-            self.duplicate_ack_count = 1;
-        }
-
-        // Update congestion window size
-        if let Some(index) = self.send_window.iter().position(|p| packet.ack_nr() == p.seq_nr()) {
-            // Calculate the sum of the size of every packet implicitly and explicitly acknowledged
-            // by the inbound packet (i.e., every packet whose sequence number precedes the inbound
-            // packet's acknowledgement number, plus the packet whose sequence number matches)
-            let bytes_newly_acked = self.send_window
-                                        .iter()
-                                        .take(index + 1)
-                                        .fold(0, |acc, p| acc + p.len());
-
-            // Update base and current delay
-            let now = now_microseconds() as i64;
-            let our_delay = now - self.send_window[index].timestamp_microseconds() as i64;
-            debug!("our_delay: {}", our_delay);
-            self.update_base_delay(our_delay, now);
-            self.update_current_delay(our_delay, now);
-
-            let off_target: f64 = (TARGET as f64 - self.queuing_delay() as f64) / TARGET as f64;
-            debug!("off_target: {}", off_target);
-
-            self.update_congestion_window(off_target, bytes_newly_acked as u32);
-
-            // Update congestion timeout
-            let rtt = (TARGET - off_target as i64) / 1000; // in milliseconds
-            self.update_congestion_timeout(rtt as i32);
-        }
-
-        let mut packet_loss_detected: bool = !self.send_window.is_empty() &&
-                                             self.duplicate_ack_count == 3;
-
-        // Process extensions, if any
-        for extension in packet.extensions.iter() {
-            if extension.get_type() == ExtensionType::SelectiveAck {
-                // If three or more packets are acknowledged past the implicit missing one,
-                // assume it was lost.
-                if extension.iter().count_ones() >= 3 {
-                    self.resend_lost_packet(packet.ack_nr() + 1);
-                    packet_loss_detected = true;
-                }
-
-                if let Some(last_seq_nr) = self.send_window.last().map(Packet::seq_nr) {
-                    for seq_nr in extension.iter()
-                                           .enumerate()
-                                           .filter(|&(_idx, received)| !received)
-                                           .map(|(idx, _received)| {
-                                               packet.ack_nr() + 2 + idx as u16
-                                           })
-                                           .take_while(|&seq_nr| seq_nr < last_seq_nr) {
-                        debug!("SACK: packet {} lost", seq_nr);
-                        self.resend_lost_packet(seq_nr);
-                        packet_loss_detected = true;
-                    }
-                }
-            } else {
-                debug!("Unknown extension {:?}, ignoring", extension.get_type());
-            }
-        }
-
-        // Three duplicate ACKs mean a fast resend request. Resend the first unacknowledged packet
-        // if the incoming packet doesn't have a SACK extension. If it does, the lost packets were
-        // already resent.
-        if !self.send_window.is_empty() && self.duplicate_ack_count == 3 &&
-           !packet.extensions.iter().any(|ext| ext.get_type() == ExtensionType::SelectiveAck) {
-            self.resend_lost_packet(packet.ack_nr().wrapping_add(1));
-        }
-
-        // Packet lost, halve the congestion window
-        if packet_loss_detected {
-            debug!("packet loss detected, halving congestion window");
-            self.cwnd = max(self.cwnd / 2, MIN_CWND * MSS);
-            debug!("cwnd: {}", self.cwnd);
-        }
-
-        // Success, advance send window
-        self.advance_send_window();
-    }
-
     /// Inserts a packet into the socket's buffer.
     ///
     /// The packet is inserted in such a way that the packets in the buffer are sorted according to
@@ -1422,6 +475,1136 @@ impl UtpSocket {
                 self.incoming_buffer.insert(i, packet);
             }
         }
+    }
+}
+
+/// A structure that represents a uTP (Micro Transport Protocol) connection between a local socket
+/// and a remote socket.
+///
+/// The socket will be closed when the value is dropped (either explicitly or when it goes out of
+/// scope).
+///
+/// The default maximum retransmission retries is 5, which translates to about 16 seconds. It can be
+/// changed by assigning the desired maximum retransmission retries to a socket's
+/// `max_retransmission_retries` field. Notice that the initial congestion timeout is 500 ms and
+/// doubles with each timeout.
+///
+/// # Examples
+///
+/// ```no_run
+/// use utp::UtpSocket;
+///
+/// let mut socket = UtpSocket::bind("127.0.0.1:1234").expect("Error binding socket");
+///
+/// let mut buf = [0; 1000];
+/// let (amt, _src) = socket.recv_from(&mut buf).expect("Error receiving");
+///
+/// let mut buf = &mut buf[..amt];
+/// buf.reverse();
+/// let _ = socket.send_to(buf).expect("Error sending");
+///
+/// // Close the socket. You can either call `close` on the socket,
+/// // explicitly drop it or just let it go out of scope.
+/// socket.close();
+/// ```
+pub struct UtpSocket {
+    /// The wrapped UDP socket
+    socket: UdpSocket,
+
+    /// The inner state of the socket, shared between all clones of this socket.
+    inner: Arc<Mutex<UtpSocketInner>>,
+}
+
+impl UtpSocket {
+    /// Creates a new UTP socket from the given UDP socket and the remote peer's address.
+    ///
+    /// The connection identifier of the resulting socket is randomly generated.
+    fn from_raw_parts(s: UdpSocket, src: SocketAddr) -> UtpSocket {
+        // Safely generate the two sequential connection identifiers.
+        // This avoids an overflow when the generated receiver identifier is the largest
+        // representable value in u16 and it is incremented to yield the corresponding sender
+        // identifier.
+        let (receiver_id, sender_id) =
+            || -> (u16, u16) {
+                let mut rng = rand::thread_rng();
+                loop {
+                    let id = rng.gen::<u16>();
+                    if id.checked_add(1).is_some() {
+                        return (id, id + 1);
+                    }
+                }
+            }();
+
+        let inner = Arc::new(Mutex::new(UtpSocketInner {
+            connected_to: src,
+            receiver_connection_id: receiver_id,
+            sender_connection_id: sender_id,
+            seq_nr: 1,
+            ack_nr: 0,
+            state: SocketState::New,
+            incoming_buffer: Vec::new(),
+            send_window: Vec::new(),
+            unsent_queue: VecDeque::new(),
+            duplicate_ack_count: 0,
+            last_acked: 0,
+            last_acked_timestamp: 0,
+            last_dropped: 0,
+            rtt: 0,
+            rtt_variance: 0,
+            read_ready_data: VecDeque::new(),
+            pending_data: VecDeque::new(),
+            curr_window: 0,
+            remote_wnd_size: 0,
+            current_delays: Vec::new(),
+            base_delays: VecDeque::with_capacity(BASE_HISTORY),
+            their_delay: 0,
+            last_rollover: 0,
+            congestion_timeout: INITIAL_CONGESTION_TIMEOUT,
+            cwnd: INIT_CWND * MSS,
+            max_retransmission_retries: MAX_RETRANSMISSION_RETRIES,
+            user_read_timeout: 0,
+            last_congestion_update: SteadyTime::now(),
+            retries: 0,
+            state_packet: None,
+        }));
+
+        UtpSocket {
+            socket: s,
+            inner: inner,
+        }
+    }
+
+    /// Creates a new UTP socket from the given UDP socket.
+    pub fn bind_with_udp_socket(socket: UdpSocket) -> Result<UtpSocket> {
+        socket.local_addr().map(|a| UtpSocket::from_raw_parts(socket, a))
+    }
+
+    /// Creates a new UTP socket from the given address.
+    ///
+    /// The address type can be any implementer of the `ToSocketAddr` trait. See its documentation
+    /// for concrete examples.
+    ///
+    /// If more than one valid address is specified, only the first will be used.
+    pub fn bind<A: ToSocketAddrs>(addr: A) -> Result<UtpSocket> {
+        take_address(addr).and_then(|a| UdpSocket::bind(a).map(|s| UtpSocket::from_raw_parts(s, a)))
+    }
+
+    /// Returns the socket address that this socket was created from.
+    pub fn local_addr(&self) -> Result<SocketAddr> {
+        self.socket.local_addr()
+    }
+
+    /// Returns the socket address of the remote peer of this UTP connection.
+    pub fn peer_addr(&self) -> Result<SocketAddr> {
+        let inner = self.inner.lock().unwrap();
+        if inner.state == SocketState::Connected || inner.state == SocketState::FinSent {
+            Ok(inner.connected_to)
+        } else {
+            Err(Error::from(SocketError::NotConnected))
+        }
+    }
+
+    /// Opens a connection to a remote host by hostname or IP address.
+    ///
+    /// The address type can be any implementer of the `ToSocketAddr` trait. See its documentation
+    /// for concrete examples.
+    ///
+    /// If more than one valid address is specified, only the first will be used.
+    pub fn connect<A: ToSocketAddrs>(other: A) -> Result<UtpSocket> {
+        let addr = try!(take_address(other));
+        let my_addr = match addr {
+            SocketAddr::V4(_) => "0.0.0.0:0",
+            SocketAddr::V6(_) => ":::0",
+        };
+        let mut socket = try!(UtpSocket::bind(my_addr));
+        let (mut packet, mut syn_timeout) = {
+            let mut inner = socket.inner.lock().unwrap();
+            inner.connected_to = addr;
+
+            let mut packet = Packet::new();
+            packet.set_type(PacketType::Syn);
+            packet.set_connection_id(inner.receiver_connection_id);
+            packet.set_seq_nr(inner.seq_nr);
+
+            let syn_timeout = inner.congestion_timeout;
+            (packet, syn_timeout)
+        };
+        let mut buf = [0; BUF_SIZE];
+        let mut syn_retries = 0;
+
+        while syn_retries < MAX_SYN_RETRIES {
+            packet.set_timestamp_microseconds(now_microseconds());
+
+            // Send packet
+            {
+                let mut inner = socket.inner.lock().unwrap();
+                debug!("Connecting to {}", inner.connected_to);
+                try!(socket.socket.send_to(&packet.to_bytes()[..], inner.connected_to));
+                inner.state = SocketState::SynSent;
+                debug!("sent {:?}", packet);
+            };
+
+            // Validate response
+            socket.socket
+                  .set_read_timeout(Some(Duration::from_millis(syn_timeout)))
+                  .expect("Error setting read timeout");
+            match socket.socket.recv_from(&mut buf) {
+                Ok((read, addr)) => {
+                    let packet = try!(Packet::from_bytes(&buf[..read]).or(Err(SocketError::InvalidPacket)));
+
+                    {
+                        let mut inner = socket.inner.lock().unwrap();
+                        inner.connected_to = addr;
+                    };
+
+                    if packet.get_type() != PacketType::State {
+                        // The network might have dropped the `State` packet
+                        // from the peer, so we need to ask for it again.
+                        syn_retries += 1;
+                        continue;
+                    }
+
+                    try!(socket.handle_packet(&packet, addr));
+
+                    return Ok(socket);
+                },
+                Err(ref e) if (e.kind() == ErrorKind::WouldBlock ||
+                               e.kind() == ErrorKind::TimedOut) => {
+                    debug!("Timed out, retrying");
+                    syn_timeout *= 2;
+                    syn_retries += 1;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+        }
+
+        Err(Error::from(SocketError::ConnectionTimedOut))
+    }
+
+    /// If you have already prepared UDP sockets at each end (e.g. you're doing
+    /// hole punching), then the rendezvous connection setup is your choice.
+    ///
+    /// Rendezvous connection will only use the specified socket and addresses,
+    /// but each end must call `rendezvous_connect` itself.
+    ///
+    /// This is an unofficial extension to the uTP protocol. Both peers will try
+    /// to act as initiator and acceptor sockets. Then, the connection id which
+    /// is numerically lower decides which end will assume which role (initiator
+    /// or acceptor).
+    pub fn rendezvous_connect<A: ToSocketAddrs>(udp_socket: UdpSocket,
+                                                other: A)
+                                                -> Result<UtpSocket> {
+        let addr = try!(take_address(other));
+        let mut socket = try!(UtpSocket::bind_with_udp_socket(udp_socket));
+        socket.rendezvous_connect_to(addr).map(|_| socket)
+    }
+
+    fn rendezvous_connect_to(&mut self, addr: SocketAddr) -> Result<()> {
+        let (mut packet, mut syn_timeout) = {
+            let mut inner = self.inner.lock().unwrap();
+            inner.connected_to = addr;
+
+            let mut packet = Packet::new();
+            packet.set_type(PacketType::Syn);
+            packet.set_connection_id(inner.receiver_connection_id);
+            packet.set_seq_nr(inner.seq_nr);
+
+            let syn_timeout = inner.congestion_timeout;
+            (packet, syn_timeout)
+        };
+        let mut buf = [0; BUF_SIZE];
+        let mut retry_count = 0;
+
+        let mut rx_syn: Option<Packet> = None;
+        let mut rx_state: Option<Packet> = None;
+
+        while retry_count < MAX_SYN_RETRIES {
+            packet.set_timestamp_microseconds(now_microseconds());
+
+            // Send packet
+            {
+                let mut inner = self.inner.lock().unwrap();
+                debug!("Connecting to {}", inner.connected_to);
+                try!(self.socket.send_to(&packet.to_bytes()[..], inner.connected_to));
+                inner.state = SocketState::SynSent;
+                debug!("sent {:?}", packet);
+            }
+
+            try!(self.socket.set_read_timeout(Some(Duration::from_millis(syn_timeout))));
+
+            // Validate response
+            match self.socket.recv_from(&mut buf) {
+                Ok((read, src)) => {
+                    let mut packet = match Packet::from_bytes(&buf[..read]) {
+                        Ok(packet) => packet,
+                        Err(_) => {
+                            continue;
+                        }
+                    };
+
+                    let cid = {
+                        let inner = self.inner.lock().unwrap();
+                        min(inner.receiver_connection_id, packet.connection_id())
+                    };
+
+                    packet.set_connection_id(cid);
+
+                    // Would be nicer to handle this in the handle_packet
+                    // function, but we'd need to add new socket state
+                    // not to interfere with SocketState::New and
+                    // SocketState::SynSent states.
+                    match packet.get_type() {
+                        PacketType::Syn => {
+                            let (reply, connected_to) = {
+                                let mut inner = self.inner.lock().unwrap();
+                                inner.receiver_connection_id = cid;
+                                inner.sender_connection_id = cid + 1;
+
+                                let reply = inner.prepare_reply(&packet, PacketType::State);
+                                (reply, inner.connected_to)
+                            };
+                            try!(self.socket.send_to(&reply.to_bytes()[..], connected_to));
+
+                            rx_syn = Some(packet);
+                        }
+                        PacketType::State => {
+                            {
+                                let mut inner = self.inner.lock().unwrap();
+                                inner.receiver_connection_id = cid;
+                                inner.sender_connection_id = cid + 1;
+                            };
+
+                            rx_state = Some(packet);
+                        }
+                        _ => continue,
+                    }
+
+                    match (&rx_syn, &rx_state) {
+                        (&Some(ref _syn), &Some(ref state)) => {
+                            try!(self.handle_packet(state, src));
+                            return Ok(());
+                        }
+                        _ => continue,
+                    }
+                }
+                Err(ref e) if (e.kind() == ErrorKind::WouldBlock ||
+                               e.kind() == ErrorKind::TimedOut) => {
+                    debug!("Timed out, retrying");
+                    syn_timeout *= 2;
+                    retry_count += 1;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+        }
+
+        Err(Error::from(SocketError::ConnectionTimedOut))
+    }
+
+    /// Gracefully closes connection to peer.
+    ///
+    /// This method allows both peers to receive all packets still in
+    /// flight.
+    pub fn close(&mut self) -> Result<()> {
+        {
+            let inner = self.inner.lock().unwrap();
+            // Nothing to do if the socket's already closed or not connected
+            if inner.state == SocketState::Closed || inner.state == SocketState::New ||
+               inner.state == SocketState::SynSent {
+                return Ok(());
+            }
+        };
+
+        // Flush unsent and unacknowledged packets
+        try!(self.flush());
+
+        let (packet, connected_to) = {
+            let inner = self.inner.lock().unwrap();
+
+            let mut packet = Packet::new();
+            packet.set_connection_id(inner.sender_connection_id);
+            packet.set_seq_nr(inner.seq_nr);
+            packet.set_ack_nr(inner.ack_nr);
+            packet.set_timestamp_microseconds(now_microseconds());
+            packet.set_type(PacketType::Fin);
+
+            (packet, inner.connected_to)
+        };
+        // Send FIN
+        try!(self.socket.send_to(&packet.to_bytes()[..], connected_to));
+
+        {
+            let mut inner = self.inner.lock().unwrap();
+            debug!("sent {:?}", packet);
+            inner.state = SocketState::FinSent;
+        };
+
+        // Receive JAKE
+        let mut buf = [0; BUF_SIZE];
+        loop {
+            {
+                let inner = self.inner.lock().unwrap();
+                if inner.state == SocketState::Closed {
+                    break;
+                }
+            }
+            try!(self.recv(&mut buf, false));
+        }
+
+        Ok(())
+    }
+
+    /// Receives data from socket.
+    ///
+    /// On success, returns the number of bytes read and the sender's address.
+    /// Returns 0 bytes read after receiving a FIN packet when the remaining
+    /// in-flight packets are consumed.
+    pub fn recv_from(&mut self, buf: &mut [u8]) -> Result<(usize, SocketAddr)> {
+        let (read, connected_to) = {
+            let mut inner = self.inner.lock().unwrap();
+            let read = {
+                let (read_ready_0, read_ready_1) = inner.read_ready_data.as_slices();
+                let mut read = 0;
+                if read_ready_0.len() > 0 {
+                    read = unsafe_copy(read_ready_0, buf)
+                }
+                if read_ready_1.len() > 0 {
+                    read += unsafe_copy(read_ready_1, &mut buf[read..])
+                }
+                read
+            };
+            if read > 0 {
+                inner.read_ready_data.drain(..read);
+                return Ok((read, inner.connected_to));
+            }
+
+            (inner.flush_incoming_buffer(buf), inner.connected_to)
+        };
+
+        if read > 0 {
+            Ok((read, connected_to))
+        } else {
+            // If the socket received a reset packet and all data has been flushed, then it can't
+            // receive anything else
+            {
+                let inner = self.inner.lock().unwrap();
+                if inner.state == SocketState::ResetReceived {
+                    return Err(Error::from(SocketError::ConnectionReset));
+                }
+            };
+
+            loop {
+                {
+                    let inner = self.inner.lock().unwrap();
+                    // A closed socket with no pending data can only "read" 0 new bytes.
+                    if inner.state == SocketState::Closed {
+                        return Ok((0, inner.connected_to));
+                    }
+                }
+
+                match self.recv(buf, true) {
+                    Ok((0, _src)) => continue,
+                    Ok(x) => return Ok(x),
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+    }
+
+    /// Changes read operations to block for at most the specified number of
+    /// milliseconds.
+    pub fn set_read_timeout(&mut self, user_timeout: Option<u64>) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.user_read_timeout = match user_timeout {
+            Some(t) => {
+                if t > 0 {
+                    t
+                } else {
+                    0
+                }
+            }
+            None => 0,
+        }
+    }
+
+    #[cfg(windows)]
+    fn ignore_udp_error(e: &Error) -> bool {
+        // On Windows, the recv_from operation on the UDP socket may return the
+        // following errors, which are expected and should be ignored:
+        //
+        // - 10054 (WSAECONNRESET): Windows can send this error if a previous
+        //   send operation resulted in an ICMP Port Unreachable. And if it's a
+        //   loopback interface, it can know whether there is already another
+        //   end to communicate.
+        // - 10040 (WSAEMSGSIZE): This error was randomly appearing in a test
+        //   that I conducted. Not really sure why it's happening. The frequency
+        //   decreased when I increased the receive buffer size, but it was not
+        //   important to get a network up and running.
+        //
+        // Without these changes, it was impossible to get a relatively large
+        // network running without issues. By large I mean a test that might be
+        // too bursting for a single machine to run.
+        //
+        // More references:
+        //
+        // - http://stackoverflow.com/questions/30749423/is-winsock-error-10054-wsaeconnreset-normal-with-udp-to-from-localhost#comment49588739_30749423
+        // - https://github.com/maidsafe/crust/pull/454
+        const WSAECONNRESET: i32 = 10054;
+        const WSAEMSGSIZE: i32 = 10040;
+        match e.raw_os_error() {
+            Some(e) => match e {
+                WSAECONNRESET | WSAEMSGSIZE => true,
+                _ => false,
+            },
+            None => false,
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn ignore_udp_error(_: &Error) -> bool {
+        false
+    }
+
+    fn recv(&mut self, buf: &mut [u8], use_user_timeout: bool) -> Result<(usize, SocketAddr)> {
+        let mut b = [0; BUF_SIZE + HEADER_SIZE];
+        let now = SteadyTime::now();
+        let (read, src);
+        let user_timeout = if use_user_timeout {
+            let inner = self.inner.lock().unwrap();
+            inner.user_read_timeout
+        } else {
+            0
+        };
+        let use_user_timeout = user_timeout != 0;
+
+        // Try to receive a packet and handle timeouts
+        loop {
+            {
+                let mut inner = self.inner.lock().unwrap();
+
+                // Abort loop if the current try exceeds the maximum number of retransmission retries.
+                if inner.retries >= inner.max_retransmission_retries {
+                    debug!("exceeds max_retransmission_retries : {} ; current connect state is : {:?}",
+                           inner.max_retransmission_retries,
+                           inner.state);
+                    inner.state = SocketState::Closed;
+                    debug!("socket marked as closed to {:?}",
+                           inner.connected_to);
+                    return Err(Error::from(SocketError::ConnectionTimedOut));
+                }
+
+                let timeout;
+                let congestion_timeout = if inner.state != SocketState::New {
+                    debug!("setting read timeout of {} ms", inner.congestion_timeout);
+                    Some(Duration::from_millis(inner.congestion_timeout))
+                } else {
+                    None
+                };
+                {
+                    let user_timeout = Duration::from_millis(user_timeout);
+                    timeout = if use_user_timeout {
+                        match congestion_timeout {
+                            Some(congestion_timeout) => {
+                                use std::cmp::min;
+                                Some(min(congestion_timeout, user_timeout))
+                            }
+                            None => Some(user_timeout),
+                        }
+                    } else {
+                        congestion_timeout
+                    };
+                }
+
+                if use_user_timeout {
+                    let user_timeout = time::Duration::milliseconds(user_timeout as i64);
+                    if (SteadyTime::now() - now) >= user_timeout {
+                        return Err(Error::from(SocketError::UserTimedOut));
+                    }
+                }
+
+                self.socket.set_read_timeout(timeout).expect("Error setting read timeout");
+            }
+
+            match self.socket.recv_from(&mut b) {
+                Ok((r, s)) => {
+                    read = r;
+                    src = s;
+                    break;
+                }
+                Err(ref e) if (e.kind() == ErrorKind::WouldBlock ||
+                               e.kind() == ErrorKind::TimedOut) => {
+                    debug!("recv_from timed out");
+                    let now = SteadyTime::now();
+                    let (congestion_timeout, last_congestion_update) = {
+                        let inner = self.inner.lock().unwrap();
+                        let congestion_timeout = {
+                            time::Duration::milliseconds(inner.congestion_timeout as i64)
+                        };
+                        (congestion_timeout, inner.last_congestion_update)
+                    };
+                    if !use_user_timeout ||
+                       ((now - last_congestion_update) >= congestion_timeout) {
+                        {
+                            let mut inner = self.inner.lock().unwrap();
+                            inner.last_congestion_update = now;
+                            inner.retries += 1;
+                        }
+                        try!(self.handle_receive_timeout());
+                    }
+                }
+                Err(ref e) if Self::ignore_udp_error(e) => (),
+                Err(e) => return Err(e),
+            };
+
+            let elapsed = (SteadyTime::now() - now).num_milliseconds();
+            debug!("{} ms elapsed", elapsed);
+        }
+
+        let packet = {
+            let mut inner = self.inner.lock().unwrap();
+            inner.last_congestion_update = SteadyTime::now();
+            inner.retries = 0;
+
+            // Decode received data into a packet
+            match Packet::from_bytes(&b[..read]) {
+                Ok(packet) => packet,
+                Err(e) => {
+                    debug!("{}", e);
+                    debug!("Ignoring invalid packet");
+                    return Ok((0, inner.connected_to));
+                }
+            }
+        };
+        debug!("received {:?}", packet);
+
+        // Process packet, including sending a reply if necessary
+        if let Some(mut pkt) = try!(self.handle_packet(&packet, src)) {
+            pkt.set_wnd_size(BUF_SIZE as u32);
+            try!(self.socket.send_to(&pkt.to_bytes()[..], src));
+            debug!("sent {:?}", pkt);
+        }
+
+        // Insert data packet into the incoming buffer if it isn't a duplicate of a previously
+        // discarded packet
+        let mut inner = self.inner.lock().unwrap();
+        if packet.get_type() == PacketType::Data {
+            if Sequence::less(inner.last_dropped, packet.seq_nr()) {
+                inner.insert_into_buffer(packet);
+            }
+        }
+
+        // Flush incoming buffer if possible
+        let read = inner.flush_incoming_buffer(buf);
+
+        Ok((read, src))
+    }
+
+    fn handle_receive_timeout(&mut self) -> Result<()> {
+        let stuff = {
+            let mut inner = self.inner.lock().unwrap();
+            inner.congestion_timeout *= 2;
+            inner.cwnd = MSS;
+
+            // There are three possible cases here:
+            //
+            // - If the socket is sending and waiting for acknowledgements (the send window is
+            //   not empty), resend the first unacknowledged packet;
+            //
+            // - If the socket is not sending and it hasn't sent a FIN yet, then it's waiting
+            //   for incoming packets: send a fast resend request;
+            //
+            // - If the socket sent a FIN previously, resend it.
+            debug!("self.send_window: {:?}",
+                   inner.send_window
+                        .iter()
+                        .map(Packet::seq_nr)
+                        .collect::<Vec<u16>>());
+
+            if inner.send_window.is_empty() {
+                // The socket is trying to close, all sent packets were acknowledged, and it has
+                // already sent a FIN: resend it.
+                if inner.state == SocketState::FinSent {
+                    let mut packet = Packet::new();
+                    packet.set_connection_id(inner.sender_connection_id);
+                    packet.set_seq_nr(inner.seq_nr);
+                    packet.set_ack_nr(inner.ack_nr);
+                    packet.set_timestamp_microseconds(now_microseconds());
+                    packet.set_type(PacketType::Fin);
+
+                    // Send FIN
+                    let connected_to = inner.connected_to;
+                    debug!("resending FIN: {:?}", packet);
+                    let data = packet.to_bytes();
+                    Ok((data, connected_to))
+                } else if inner.state != SocketState::New {
+                    // The socket is waiting for incoming packets but the remote peer is silent:
+                    // send a fast resend request.
+                    debug!("sending fast resend request");
+                    Err(true)
+                }
+                else {
+                    Err(false)
+                }
+            } else {
+                // The socket is sending data packets but there is no reply from the remote
+                // peer: resend the first unacknowledged packet with the current timestamp.
+                let connected_to = inner.connected_to;
+                let mut packet = &mut inner.send_window[0];
+                packet.set_timestamp_microseconds(now_microseconds());
+                debug!("resending {:?}", packet);
+                let data = packet.to_bytes();
+                Ok((data, connected_to))
+            }
+        };
+
+        match stuff {
+            Ok((data, connected_to)) => {
+                try!(self.socket.send_to(&data[..], connected_to));
+            },
+            Err(true) => {
+                self.send_fast_resend_request();
+            },
+            Err(false) => (),
+        };
+
+        Ok(())
+    }
+
+    /// Sends data on the socket to the remote peer. On success, returns the number of bytes
+    /// written.
+    //
+    // # Implementation details
+    //
+    // This method inserts packets into the send buffer and keeps trying to
+    // advance the send window until an ACK corresponding to the last packet is
+    // received.
+    //
+    // Note that the buffer passed to `send_to` might exceed the maximum packet
+    // size, which will result in the data being split over several packets.
+    pub fn send_to(&mut self, buf: &[u8]) -> Result<usize> {
+        let total_length = {
+            let mut inner = self.inner.lock().unwrap();
+            if inner.state == SocketState::Closed {
+                return Err(Error::from(SocketError::ConnectionClosed));
+            }
+
+            let total_length = buf.len();
+
+            for chunk in buf.chunks(MSS as usize - HEADER_SIZE) {
+                let mut packet = Packet::with_payload(chunk);
+                packet.set_seq_nr(inner.seq_nr);
+                packet.set_ack_nr(inner.ack_nr);
+                packet.set_connection_id(inner.sender_connection_id);
+
+                inner.unsent_queue.push_back(packet);
+
+                // `OverflowingOps` is marked unstable, so we can't use `overflowing_add` here
+                if inner.seq_nr == ::std::u16::MAX {
+                    inner.seq_nr = 0;
+                } else {
+                    inner.seq_nr += 1;
+                }
+            }
+            total_length
+        };
+
+        // Send every packet in the queue
+        try!(self.send());
+
+        Ok(total_length)
+    }
+
+    /// Consumes acknowledgements for every pending packet.
+    pub fn flush(&mut self) -> Result<()> {
+        let mut buf = [0u8; BUF_SIZE];
+        loop {
+            {
+                let inner = self.inner.lock().unwrap();
+                if inner.send_window.is_empty() {
+                    break;
+                }
+                debug!("packets in send window: {}", inner.send_window.len());
+            }
+            try!(self.recv(&mut buf, false));
+        }
+
+        Ok(())
+    }
+
+    /// Changes the maximum number of retransmission retries.
+    pub fn set_max_retransmission_retries(&mut self, n: u32) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.max_retransmission_retries = n;
+    }
+
+    fn send_state(&self) {
+        let inner = self.inner.lock().unwrap();
+        let mut packet = Packet::new();
+        packet.set_type(PacketType::State);
+        let self_t_micro: u32 = now_microseconds();
+        packet.set_timestamp_microseconds(self_t_micro);
+        packet.set_timestamp_difference_microseconds(inner.their_delay);
+        packet.set_connection_id(inner.sender_connection_id);
+        packet.set_seq_nr(inner.seq_nr);
+        packet.set_ack_nr(inner.ack_nr);
+        let connected_to = inner.connected_to;
+        drop(inner);
+        let _ = self.socket.send_to(&packet.to_bytes()[..], connected_to);
+    }
+
+    /// Send a keepalive packet on the stream.
+    pub fn send_keepalive(&self) {
+        let time_since_last_ack = {
+            let inner = self.inner.lock().unwrap();
+            now_microseconds().wrapping_sub(inner.last_acked_timestamp)
+        };
+        if time_since_last_ack > 14_000_000 {
+            self.send_state();
+        }
+    }
+
+    /// Try and clone the UtpSocket, creating two handles to the same socket that can be used
+    /// concurrently.
+    pub fn try_clone(&self) -> Result<UtpSocket> {
+        Ok(UtpSocket {
+            socket: try!(self.socket.try_clone()),
+            inner: self.inner.clone(),
+        })
+    }
+
+    /// Sends every packet in the unsent packet queue.
+    fn send(&mut self) -> Result<()> {
+        loop {
+            let mut packet = {
+                let mut inner = self.inner.lock().unwrap();
+                match inner.unsent_queue.pop_front() {
+                    Some(packet) => packet,
+                    None => break,
+                }
+            };
+            try!(self.send_packet(&mut packet));
+            let mut inner = self.inner.lock().unwrap();
+            inner.curr_window += packet.len() as u32;
+            inner.send_window.push(packet);
+        }
+        Ok(())
+    }
+
+    /// Send one packet.
+    #[inline]
+    fn send_packet(&mut self, packet: &mut Packet) -> Result<()> {
+        let max_inflight = {
+            let inner = self.inner.lock().unwrap();
+            debug!("current window: {}", inner.send_window.len());
+            min(inner.cwnd, inner.remote_wnd_size)
+        };
+        let max_inflight = max(MIN_CWND * MSS, max_inflight);
+        let now = now_microseconds();
+
+        // Wait until enough in-flight packets are acknowledged for rate control purposes, but don't
+        // wait more than 500 ms (PRE_SEND_TIMEOUT) before sending the packet.
+        loop {
+            {
+                let inner = self.inner.lock().unwrap();
+                if inner.curr_window < max_inflight || now_microseconds() - now >= PRE_SEND_TIMEOUT {
+                    break;
+                }
+                debug!("inner.curr_window: {}", inner.curr_window);
+                debug!("max_inflight: {}", max_inflight);
+                debug!("inner.duplicate_ack_count: {}", inner.duplicate_ack_count);
+                debug!("now_microseconds() - now = {}", now_microseconds() - now);
+            }
+            let mut buf = [0; BUF_SIZE];
+            let (read, _) = try!(self.recv(&mut buf, false));
+            let mut inner = self.inner.lock().unwrap();
+            inner.read_ready_data.extend(&buf[..read]);
+        }
+
+        debug!("out: now_microseconds() - now = {}",
+               now_microseconds() - now);
+
+        // Check if it still makes sense to send packet, as we might be trying to resend a lost
+        // packet acknowledged in the receive loop above.
+        // If there were no wrapping around of sequence numbers, we'd simply check if the packet's
+        // sequence number is greater than `last_acked`.
+        let inner = self.inner.lock().unwrap();
+        let distance_a = packet.seq_nr().wrapping_sub(inner.last_acked);
+        let distance_b = inner.last_acked.wrapping_sub(packet.seq_nr());
+        if distance_a > distance_b {
+            debug!("Packet already acknowledged, skipping...");
+            return Ok(());
+        }
+
+        packet.set_timestamp_microseconds(now_microseconds());
+        packet.set_timestamp_difference_microseconds(inner.their_delay);
+        let connected_to = inner.connected_to;
+        drop(inner);
+        try!(self.socket.send_to(&packet.to_bytes()[..], connected_to));
+        debug!("sent {:?}", packet);
+
+        Ok(())
+    }
+
+    /// Sends a fast resend request to the remote peer.
+    ///
+    /// A fast resend request consists of sending three State packets (acknowledging the last
+    /// received packet) in quick succession.
+    fn send_fast_resend_request(&self) {
+        for _ in 0..3 {
+            self.send_state();
+        }
+    }
+
+    fn resend_lost_packet(&mut self, lost_packet_nr: u16) {
+        debug!("---> resend_lost_packet({}) <---", lost_packet_nr);
+        let mut packet = {
+            let inner = self.inner.lock().unwrap();
+            let position = match inner.send_window.iter().position(|pkt| pkt.seq_nr() == lost_packet_nr) {
+                None => {
+                    debug!("Packet {} not found", lost_packet_nr);
+                    return;
+                },
+                Some(position) => position,
+            };
+
+            debug!("self.send_window.len(): {}", inner.send_window.len());
+            debug!("position: {}", position);
+            inner.send_window[position].clone()
+        };
+        // FIXME: Unchecked result
+        let _ = self.send_packet(&mut packet);
+
+        // We intentionally don't increase `curr_window` because otherwise a packet's length
+        // would be counted more than once
+        
+        debug!("---> END resend_lost_packet <---");
+    }
+
+    /// Handles an incoming packet, updating socket state accordingly.
+    ///
+    /// Returns the appropriate reply packet, if needed.
+    fn handle_packet(&mut self, packet: &Packet, src: SocketAddr) -> Result<Option<Packet>> {
+        let (ret, state_packet) = {
+            let mut inner = self.inner.lock().unwrap();
+            debug!("({:?}, {:?})", inner.state, packet.get_type());
+
+            let is_data_or_fin = packet.get_type() == PacketType::Data
+                              || packet.get_type() == PacketType::Fin;
+
+            // Acknowledge only if the packet strictly follows the previous one
+            // and only if it is a payload packet. The restriction on PacketType
+            // is due to all other (non Data) packets are assigned seq_nr the
+            // same as the next Data packet, thus we could acknowledge what
+            // we have not received yet.
+            if is_data_or_fin && packet.seq_nr().wrapping_sub(inner.ack_nr) == 1 {
+                inner.ack_nr = packet.seq_nr();
+            }
+
+            // Reset connection if connection id doesn't match and this isn't a SYN
+            if packet.get_type() != PacketType::Syn && inner.state != SocketState::SynSent &&
+               !(packet.connection_id() == inner.sender_connection_id ||
+                 packet.connection_id() == inner.receiver_connection_id) {
+                return Ok(Some(inner.prepare_reply(packet, PacketType::Reset)));
+            }
+
+            // Update remote window size
+            inner.remote_wnd_size = packet.wnd_size();
+            debug!("inner.remote_wnd_size: {}", inner.remote_wnd_size);
+
+            // Update remote peer's delay between them sending the packet and us receiving it
+            let now = now_microseconds();
+            inner.their_delay = now.wrapping_sub(packet.timestamp_microseconds());
+            debug!("inner.their_delay: {}", inner.their_delay);
+
+            match (inner.state, packet.get_type()) {
+                (SocketState::New, PacketType::Syn) => {
+                    inner.connected_to = src;
+                    inner.ack_nr = packet.seq_nr();
+                    inner.seq_nr = rand::random();
+                    inner.last_acked = inner.seq_nr.wrapping_sub(1);
+                    inner.receiver_connection_id = packet.connection_id() + 1;
+                    inner.sender_connection_id = packet.connection_id();
+                    inner.state = SocketState::Connected;
+                    inner.last_dropped = inner.ack_nr;
+
+                    inner.state_packet = Some(inner.prepare_reply(packet, PacketType::State));
+
+                    // Advance the inner.seq_nr (the sequence number of the next packet),
+                    // this is because the other end will use the `seq_nr` of this state
+                    // packet as his `inner.last_acked`
+                    inner.seq_nr = inner.seq_nr.wrapping_add(1);
+
+                    (Ok(inner.state_packet.clone()), None)
+                }
+                (SocketState::Connected, PacketType::Syn) if inner.connected_to == src => {
+                    // The other end might have sent another Syn packet because
+                    // a reply to the first one did not arrive within a timeout
+                    // caused by network congestion.
+                    (Ok(inner.state_packet.clone()), None)
+                }
+                (_, PacketType::Syn) => {
+                    (Ok(Some(inner.prepare_reply(packet, PacketType::Reset))), None)
+                }
+                (SocketState::SynSent, PacketType::State) => {
+                    inner.connected_to = src;
+                    inner.ack_nr = packet.seq_nr();
+                    inner.seq_nr += 1;
+                    inner.state = SocketState::Connected;
+                    inner.last_acked = packet.ack_nr();
+                    inner.last_dropped = packet.seq_nr();
+                    inner.last_acked_timestamp = now_microseconds();
+                    (Ok(None), None)
+                }
+                (SocketState::SynSent, _) => (Err(Error::from(SocketError::InvalidReply)), None),
+                (SocketState::Connected, PacketType::Data) |
+                (SocketState::FinSent, PacketType::Data) => (Ok(inner.handle_data_packet(packet)), None),
+                (SocketState::Connected, PacketType::State) => {
+                    (Ok(None), Some(packet))
+                }
+                (SocketState::Connected, PacketType::Fin) |
+                (SocketState::FinSent, PacketType::Fin) => {
+                    if packet.ack_nr() < inner.seq_nr {
+                        debug!("FIN received but there are missing acknowledgements for sent packets");
+                    }
+                    let mut reply = inner.prepare_reply(packet, PacketType::State);
+                    if packet.seq_nr().wrapping_sub(inner.ack_nr) > 1 {
+                        debug!("current ack_nr ({}) is behind received packet seq_nr ({})",
+                               inner.ack_nr,
+                               packet.seq_nr());
+
+                        // Set SACK extension payload if the packet is not in order
+                        let sack = inner.build_selective_ack();
+
+                        if sack.len() > 0 {
+                            reply.set_sack(sack);
+                        }
+                    }
+
+                    // Give up, the remote peer might not care about our missing packets
+                    inner.state = SocketState::Closed;
+                    (Ok(Some(reply)), None)
+                }
+                (SocketState::FinSent, PacketType::State) => {
+                    if packet.ack_nr() == inner.seq_nr {
+                        inner.state = SocketState::Closed;
+                        (Ok(None), None)
+                    } else {
+                        (Ok(None), Some(packet))
+                    }
+                }
+                (_, PacketType::Reset) => {
+                    inner.state = SocketState::ResetReceived;
+                    (Err(Error::from(SocketError::ConnectionReset)), None)
+                }
+                (state, ty) => {
+                    let message = format!("Unimplemented handling for ({:?},{:?})", state, ty);
+                    debug!("{}", message);
+                    (Err(Error::new(ErrorKind::Other, message)), None)
+                }
+            }
+        };
+        if let Some(state_packet) = state_packet {
+            self.handle_state_packet(state_packet);
+        };
+        ret
+    }
+
+    fn handle_state_packet(&mut self, packet: &Packet) {
+        let mut packet_loss_detected = {
+            let mut inner = self.inner.lock().unwrap();
+            if packet.ack_nr() == inner.last_acked {
+                inner.duplicate_ack_count += 1;
+            } else {
+                inner.last_acked = packet.ack_nr();
+                inner.last_acked_timestamp = now_microseconds();
+                inner.duplicate_ack_count = 1;
+            }
+
+            // Update congestion window size
+            if let Some(index) = inner.send_window.iter().position(|p| packet.ack_nr() == p.seq_nr()) {
+                // Calculate the sum of the size of every packet implicitly and explicitly acknowledged
+                // by the inbound packet (i.e., every packet whose sequence number precedes the inbound
+                // packet's acknowledgement number, plus the packet whose sequence number matches)
+                let bytes_newly_acked = inner.send_window
+                                             .iter()
+                                             .take(index + 1)
+                                             .fold(0, |acc, p| acc + p.len());
+
+                // Update base and current delay
+                let now = now_microseconds() as i64;
+                let our_delay = now - inner.send_window[index].timestamp_microseconds() as i64;
+                debug!("our_delay: {}", our_delay);
+                inner.update_base_delay(our_delay, now);
+                inner.update_current_delay(our_delay, now);
+
+                let off_target: f64 = (TARGET as f64 - inner.queuing_delay() as f64) / TARGET as f64;
+                debug!("off_target: {}", off_target);
+
+                inner.update_congestion_window(off_target, bytes_newly_acked as u32);
+
+                // Update congestion timeout
+                let rtt = (TARGET - off_target as i64) / 1000; // in milliseconds
+                inner.update_congestion_timeout(rtt as i32);
+            }
+
+            !inner.send_window.is_empty() && inner.duplicate_ack_count == 3
+        };
+
+        // Process extensions, if any
+        for extension in packet.extensions.iter() {
+            if extension.get_type() == ExtensionType::SelectiveAck {
+                // If three or more packets are acknowledged past the implicit missing one,
+                // assume it was lost.
+                if extension.iter().count_ones() >= 3 {
+                    self.resend_lost_packet(packet.ack_nr() + 1);
+                    packet_loss_detected = true;
+                }
+                
+                let last_seq_nr_opt = {
+                    let inner = self.inner.lock().unwrap();
+                    inner.send_window.last().map(Packet::seq_nr)
+                };
+                if let Some(last_seq_nr) = last_seq_nr_opt {
+                    for seq_nr in extension.iter()
+                                           .enumerate()
+                                           .filter(|&(_idx, received)| !received)
+                                           .map(|(idx, _received)| {
+                                               packet.ack_nr() + 2 + idx as u16
+                                           })
+                                           .take_while(|&seq_nr| seq_nr < last_seq_nr) {
+                        debug!("SACK: packet {} lost", seq_nr);
+                        self.resend_lost_packet(seq_nr);
+                        packet_loss_detected = true;
+                    }
+                }
+            } else {
+                debug!("Unknown extension {:?}, ignoring", extension.get_type());
+            }
+        }
+
+        // Three duplicate ACKs mean a fast resend request. Resend the first unacknowledged packet
+        // if the incoming packet doesn't have a SACK extension. If it does, the lost packets were
+        // already resent.
+        let resend = {
+            let inner = self.inner.lock().unwrap();
+            !inner.send_window.is_empty() && inner.duplicate_ack_count == 3 &&
+            !packet.extensions.iter().any(|ext| ext.get_type() == ExtensionType::SelectiveAck)
+        };
+        if resend {
+            self.resend_lost_packet(packet.ack_nr().wrapping_add(1));
+        }
+
+        // Packet lost, halve the congestion window
+        let mut inner = self.inner.lock().unwrap();
+        if packet_loss_detected {
+            debug!("packet loss detected, halving congestion window");
+            inner.cwnd = max(inner.cwnd / 2, MIN_CWND * MSS);
+            debug!("cwnd: {}", inner.cwnd);
+        }
+
+        // Success, advance send window
+        inner.advance_send_window();
     }
 }
 
@@ -1576,16 +1759,22 @@ mod test {
         let server_addr = next_test_ip4();
 
         let mut server = iotry!(UtpSocket::bind(server_addr));
-        assert!(server.state == SocketState::New);
+        {
+            let inner = server.inner.lock().unwrap();
+            assert!(inner.state == SocketState::New);
+        };
 
         let child = thread::spawn(move || {
             let mut client = iotry!(UtpSocket::connect(server_addr));
-            assert!(client.state == SocketState::Connected);
-            // Check proper difference in client's send connection id and receive connection id
-            assert_eq!(client.sender_connection_id,
-                       client.receiver_connection_id + 1);
-            assert_eq!(client.connected_to,
-                       server_addr.to_socket_addrs().unwrap().next().unwrap());
+            {
+                let inner = client.inner.lock().unwrap();
+                assert!(inner.state == SocketState::Connected);
+                // Check proper difference in client's send connection id and receive connection id
+                assert_eq!(inner.sender_connection_id,
+                           inner.receiver_connection_id + 1);
+                assert_eq!(inner.connected_to,
+                           server_addr.to_socket_addrs().unwrap().next().unwrap());
+            };
             iotry!(client.close());
             drop(client);
         });
@@ -1594,14 +1783,17 @@ mod test {
         match server.recv_from(&mut buf) {
             e => println!("{:?}", e),
         }
-        // After establishing a new connection, the server's ids are a mirror of the client's.
-        assert_eq!(server.receiver_connection_id,
-                   server.sender_connection_id + 1);
+        {
+            let inner = server.inner.lock().unwrap();
+            // After establishing a new connection, the server's ids are a mirror of the client's.
+            assert_eq!(inner.receiver_connection_id,
+                       inner.sender_connection_id + 1);
 
-        assert!(server.state == SocketState::Closed);
+            assert!(inner.state == SocketState::Closed);
+        };
         drop(server);
 
-        assert!(child.join().is_ok());
+        child.join().unwrap();
     }
 
     #[test]
@@ -1609,16 +1801,22 @@ mod test {
         let server_addr = next_test_ip6();
 
         let mut server = iotry!(UtpSocket::bind(server_addr));
-        assert!(server.state == SocketState::New);
+        {
+            let inner = server.inner.lock().unwrap();
+            assert!(inner.state == SocketState::New);
+        };
 
         let child = thread::spawn(move || {
             let mut client = iotry!(UtpSocket::connect(server_addr));
-            assert!(client.state == SocketState::Connected);
-            // Check proper difference in client's send connection id and receive connection id
-            assert_eq!(client.sender_connection_id,
-                       client.receiver_connection_id + 1);
-            assert_eq!(client.connected_to,
-                       server_addr.to_socket_addrs().unwrap().next().unwrap());
+            {
+                let inner = client.inner.lock().unwrap();
+                assert!(inner.state == SocketState::Connected);
+                // Check proper difference in client's send connection id and receive connection id
+                assert_eq!(inner.sender_connection_id,
+                           inner.receiver_connection_id + 1);
+                assert_eq!(inner.connected_to,
+                           server_addr.to_socket_addrs().unwrap().next().unwrap());
+            };
             iotry!(client.close());
             drop(client);
         });
@@ -1627,14 +1825,17 @@ mod test {
         match server.recv_from(&mut buf) {
             e => println!("{:?}", e),
         }
-        // After establishing a new connection, the server's ids are a mirror of the client's.
-        assert_eq!(server.receiver_connection_id,
-                   server.sender_connection_id + 1);
+        {
+            let inner = server.inner.lock().unwrap();
+            // After establishing a new connection, the server's ids are a mirror of the client's.
+            assert_eq!(inner.receiver_connection_id,
+                       inner.sender_connection_id + 1);
 
-        assert!(server.state == SocketState::Closed);
+            assert!(inner.state == SocketState::Closed);
+        }
         drop(server);
 
-        assert!(child.join().is_ok());
+        child.join().unwrap();
     }
 
     #[test]
@@ -1689,25 +1890,37 @@ mod test {
         let server_addr = next_test_ip4();
 
         let mut server = iotry!(UtpSocket::bind(server_addr));
-        assert!(server.state == SocketState::New);
+        {
+            let inner = server.inner.lock().unwrap();
+            assert!(inner.state == SocketState::New);
+        }
 
         let child = thread::spawn(move || {
             let mut client = iotry!(UtpSocket::connect(server_addr));
-            assert!(client.state == SocketState::Connected);
+            {
+                let inner = client.inner.lock().unwrap();
+                assert!(inner.state == SocketState::Connected);
+            };
             assert!(client.close().is_ok());
         });
 
         // Make the server listen for incoming connections until the end of the input
         let mut buf = [0u8; BUF_SIZE];
         let _resp = server.recv_from(&mut buf);
-        assert!(server.state == SocketState::Closed);
+        {
+            let inner = server.inner.lock().unwrap();
+            assert!(inner.state == SocketState::Closed);
+        };
 
         // Trying to receive again returns `Ok(0)` (equivalent to the old `EndOfFile`)
         match server.recv_from(&mut buf) {
             Ok((0, _src)) => {}
             e => panic!("Expected Ok(0), got {:?}", e),
         }
-        assert_eq!(server.state, SocketState::Closed);
+        {
+            let inner = server.inner.lock().unwrap();
+            assert_eq!(inner.state, SocketState::Closed);
+        };
 
         assert!(child.join().is_ok());
     }
@@ -1717,18 +1930,27 @@ mod test {
         let server_addr = next_test_ip4();
 
         let mut server = iotry!(UtpSocket::bind(server_addr));
-        assert!(server.state == SocketState::New);
+        {
+            let inner = server.inner.lock().unwrap();
+            assert!(inner.state == SocketState::New);
+        };
 
         let child = thread::spawn(move || {
             let mut client = iotry!(UtpSocket::connect(server_addr));
-            assert!(client.state == SocketState::Connected);
+            {
+                let inner = client.inner.lock().unwrap();
+                assert!(inner.state == SocketState::Connected);
+            };
             iotry!(client.close());
         });
 
         // Make the server listen for incoming connections
         let mut buf = [0u8; BUF_SIZE];
         let (_read, _src) = iotry!(server.recv_from(&mut buf));
-        assert_eq!(server.state, SocketState::Closed);
+        {
+            let inner = server.inner.lock().unwrap();
+            assert_eq!(inner.state, SocketState::Closed);
+        };
 
         // Trying to send to the socket after closing it raises an error
         match server.send_to(&buf) {
@@ -1751,7 +1973,10 @@ mod test {
             // Make the server listen for incoming connections
             let mut buf = [0u8; BUF_SIZE];
             let _resp = server.recv(&mut buf, false);
-            tx.send(server.seq_nr).unwrap();
+            {
+                let inner = server.inner.lock().unwrap();
+                tx.send(inner.seq_nr).unwrap();
+            };
 
             // Close the connection
             iotry!(server.recv_from(&mut buf));
@@ -1760,17 +1985,24 @@ mod test {
         });
 
         let mut client = iotry!(UtpSocket::connect(server_addr));
-        assert!(client.state == SocketState::Connected);
-        let sender_seq_nr = rx.recv().unwrap();
-        let ack_nr = client.ack_nr;
-        assert!(ack_nr != 0);
-        assert!(ack_nr.wrapping_add(1) == sender_seq_nr);
-        assert!(client.close().is_ok());
+        let ack_nr = {
+            let inner = client.inner.lock().unwrap();
+            assert!(inner.state == SocketState::Connected);
+            let sender_seq_nr = rx.recv().unwrap();
+            let ack_nr = inner.ack_nr;
+            assert!(ack_nr != 0);
+            assert!(ack_nr.wrapping_add(1) == sender_seq_nr);
+            ack_nr
+        };
+        client.close().unwrap();
 
         // The reply to both connect (SYN) and close (FIN) should be
         // STATE packets, which don't increase the sequence number
         // and, hence, the receiver's acknowledgement number.
-        assert!(client.ack_nr == ack_nr);
+        {
+            let inner = client.inner.lock().unwrap();
+            assert!(inner.ack_nr == ack_nr);
+        };
         drop(client);
 
         assert!(child.join().is_ok());
@@ -1938,7 +2170,8 @@ mod test {
         assert!(response.is_none());
 
         // Mark socket as closed
-        socket.state = SocketState::Closed;
+        let mut inner = socket.inner.lock().unwrap();
+        inner.state = SocketState::Closed;
     }
 
     #[test]
@@ -1987,7 +2220,8 @@ mod test {
         assert!(response.ack_nr() == packet.seq_nr());
 
         // Mark socket as closed
-        socket.state = SocketState::Closed;
+        let mut inner = socket.inner.lock().unwrap();
+        inner.state = SocketState::Closed;
     }
 
     #[test]
@@ -2057,7 +2291,8 @@ mod test {
         assert!(response.is_some());
 
         // Mark socket as closed
-        socket.state = SocketState::Closed;
+        let mut inner = socket.inner.lock().unwrap();
+        inner.state = SocketState::Closed;
     }
 
     #[test]
@@ -2065,14 +2300,18 @@ mod test {
         let server_addr = next_test_ip4();
 
         let mut server = iotry!(UtpSocket::bind(server_addr));
-        assert!(server.state == SocketState::New);
+        {
+            let inner = server.inner.lock().unwrap();
+            assert!(inner.state == SocketState::New);
+        };
 
         let child = thread::spawn(move || {
-            let mut client = iotry!(UtpSocket::connect(server_addr));
-            assert!(client.state == SocketState::Connected);
+            let client = iotry!(UtpSocket::connect(server_addr));
+            let mut inner = client.inner.lock().unwrap();
+            assert!(inner.state == SocketState::Connected);
             // Check proper difference in client's send connection id and receive connection id
-            assert_eq!(client.sender_connection_id,
-                       client.receiver_connection_id + 1);
+            assert_eq!(inner.sender_connection_id,
+                       inner.receiver_connection_id + 1);
             let s = client.socket.try_clone().ok().expect("Error cloning internal UDP socket");
             let mut window: Vec<Packet> = Vec::new();
 
@@ -2080,24 +2319,24 @@ mod test {
                 let mut packet = Packet::new();
                 packet.set_wnd_size(BUF_SIZE as u32);
                 packet.set_type(PacketType::Data);
-                packet.set_connection_id(client.sender_connection_id);
-                packet.set_seq_nr(client.seq_nr);
-                packet.set_ack_nr(client.ack_nr);
+                packet.set_connection_id(inner.sender_connection_id);
+                packet.set_seq_nr(inner.seq_nr);
+                packet.set_ack_nr(inner.ack_nr);
                 packet.payload = data.to_vec();
                 window.push(packet.clone());
-                client.send_window.push(packet.clone());
-                client.seq_nr += 1;
-                client.curr_window += packet.len() as u32;
+                inner.send_window.push(packet.clone());
+                inner.seq_nr += 1;
+                inner.curr_window += packet.len() as u32;
             }
 
             let mut packet = Packet::new();
             packet.set_wnd_size(BUF_SIZE as u32);
             packet.set_type(PacketType::Fin);
-            packet.set_connection_id(client.sender_connection_id);
-            packet.set_seq_nr(client.seq_nr);
-            packet.set_ack_nr(client.ack_nr);
+            packet.set_connection_id(inner.sender_connection_id);
+            packet.set_seq_nr(inner.seq_nr);
+            packet.set_ack_nr(inner.ack_nr);
             window.push(packet);
-            client.seq_nr += 1;
+            inner.seq_nr += 1;
 
             iotry!(s.send_to(&window[3].to_bytes()[..], server_addr));
             iotry!(s.send_to(&window[2].to_bytes()[..], server_addr));
@@ -2123,13 +2362,16 @@ mod test {
         }
 
         // After establishing a new connection, the server's ids are a mirror of the client's.
-        assert_eq!(server.receiver_connection_id,
-                   server.sender_connection_id + 1);
-        assert_eq!(server.state, SocketState::Closed);
+        {
+            let inner = server.inner.lock().unwrap();
+            assert_eq!(inner.receiver_connection_id,
+                       inner.sender_connection_id + 1);
+            assert_eq!(inner.state, SocketState::Closed);
+        };
         assert_eq!(received.len(), expected.len());
         assert_eq!(received, expected);
 
-        assert!(child.join().is_ok());
+        child.join().unwrap();
     }
 
     #[test]
@@ -2163,19 +2405,23 @@ mod test {
         assert_eq!(data_packet.payload.len(), data.len());
 
         // Send triple ACK
-        let mut packet = Packet::new();
-        packet.set_wnd_size(BUF_SIZE as u32);
-        packet.set_type(PacketType::State);
-        packet.set_seq_nr(server.seq_nr);
-        packet.set_ack_nr(data_packet.seq_nr() - 1);
-        packet.set_connection_id(server.sender_connection_id);
+        let (packet, connected_to) = {
+            let inner = server.inner.lock().unwrap();
+            let mut packet = Packet::new();
+            packet.set_wnd_size(BUF_SIZE as u32);
+            packet.set_type(PacketType::State);
+            packet.set_seq_nr(inner.seq_nr);
+            packet.set_ack_nr(data_packet.seq_nr() - 1);
+            packet.set_connection_id(inner.sender_connection_id);
+            (packet, inner.connected_to)
+        };
 
         for _ in 0u8..3 {
-            iotry!(server.socket.send_to(&packet.to_bytes()[..], server.connected_to));
+            iotry!(server.socket.send_to(&packet.to_bytes()[..], connected_to));
         }
 
         // Receive data again and check that it's the same we reported as missing
-        let client_addr = server.connected_to;
+        let client_addr = connected_to;
         match server.socket.recv_from(&mut buf) {
             Ok((0, _)) => panic!("Received 0 bytes from socket"),
             Ok((read, _src)) => {
@@ -2188,7 +2434,7 @@ mod test {
                 let response = response.unwrap();
                 assert!(response.is_some());
                 let response = response.unwrap();
-                iotry!(server.socket.send_to(&response.to_bytes()[..], server.connected_to));
+                iotry!(server.socket.send_to(&response.to_bytes()[..], connected_to));
             }
             Err(e) => panic!("{}", e),
         }
@@ -2218,17 +2464,26 @@ mod test {
         let data = (0..LEN).map(|idx| idx as u8).collect::<Vec<u8>>();
         let d = data.clone();
 
-        assert!(server.state == SocketState::New);
-        assert!(client.state == SocketState::New);
+        {
+            let inner = server.inner.lock().unwrap();
+            assert!(inner.state == SocketState::New);
+        };
+        {
+            let inner = client.inner.lock().unwrap();
+            assert!(inner.state == SocketState::New);
+            // Check proper difference in client's send connection id and receive connection id
+            assert_eq!(inner.sender_connection_id,
+                       inner.receiver_connection_id + 1);
+        };
 
-        // Check proper difference in client's send connection id and receive connection id
-        assert_eq!(client.sender_connection_id,
-                   client.receiver_connection_id + 1);
 
         let child = thread::spawn(move || {
             let mut client = iotry!(UtpSocket::connect(server_addr));
-            assert!(client.state == SocketState::Connected);
-            assert_eq!(client.connected_to, server_addr);
+            {
+                let inner = client.inner.lock().unwrap();
+                assert!(inner.state == SocketState::Connected);
+                assert_eq!(inner.connected_to, server_addr);
+            };
             iotry!(client.send_to(&d[..]));
             drop(client);
         });
@@ -2236,10 +2491,13 @@ mod test {
         let mut buf = [0u8; BUF_SIZE];
         server.recv(&mut buf, false).unwrap();
         // After establishing a new connection, the server's ids are a mirror of the client's.
-        assert_eq!(server.receiver_connection_id,
-                   server.sender_connection_id + 1);
+        {
+            let inner = server.inner.lock().unwrap();
+            assert_eq!(inner.receiver_connection_id,
+                       inner.sender_connection_id + 1);
 
-        assert!(server.state == SocketState::Connected);
+            assert!(inner.state == SocketState::Connected);
+        };
 
         // Purposefully read from UDP socket directly and discard it, in order
         // to behave as if the packet was lost and thus trigger the timeout
@@ -2247,7 +2505,10 @@ mod test {
         iotry!(server.socket.recv_from(&mut buf));
 
         // Set a much smaller than usual timeout, for quicker test completion
-        server.congestion_timeout = 50;
+        {
+            let mut inner = server.inner.lock().unwrap();
+            inner.congestion_timeout = 50;
+        }
 
         // Now wait for the previously discarded packet
         loop {
@@ -2266,40 +2527,41 @@ mod test {
     #[test]
     fn test_sorted_buffer_insertion() {
         let server_addr = next_test_ip4();
-        let mut socket = iotry!(UtpSocket::bind(server_addr));
+        let socket = iotry!(UtpSocket::bind(server_addr));
+        let mut inner = socket.inner.lock().unwrap();
 
         let mut packet = Packet::new();
         packet.set_seq_nr(1);
 
-        assert!(socket.incoming_buffer.is_empty());
+        assert!(inner.incoming_buffer.is_empty());
 
-        socket.insert_into_buffer(packet.clone());
-        assert_eq!(socket.incoming_buffer.len(), 1);
+        inner.insert_into_buffer(packet.clone());
+        assert_eq!(inner.incoming_buffer.len(), 1);
 
         packet.set_seq_nr(2);
         packet.set_timestamp_microseconds(128);
 
-        socket.insert_into_buffer(packet.clone());
-        assert_eq!(socket.incoming_buffer.len(), 2);
-        assert_eq!(socket.incoming_buffer[1].seq_nr(), 2);
-        assert_eq!(socket.incoming_buffer[1].timestamp_microseconds(), 128);
+        inner.insert_into_buffer(packet.clone());
+        assert_eq!(inner.incoming_buffer.len(), 2);
+        assert_eq!(inner.incoming_buffer[1].seq_nr(), 2);
+        assert_eq!(inner.incoming_buffer[1].timestamp_microseconds(), 128);
 
         packet.set_seq_nr(3);
         packet.set_timestamp_microseconds(256);
 
-        socket.insert_into_buffer(packet.clone());
-        assert_eq!(socket.incoming_buffer.len(), 3);
-        assert_eq!(socket.incoming_buffer[2].seq_nr(), 3);
-        assert_eq!(socket.incoming_buffer[2].timestamp_microseconds(), 256);
+        inner.insert_into_buffer(packet.clone());
+        assert_eq!(inner.incoming_buffer.len(), 3);
+        assert_eq!(inner.incoming_buffer[2].seq_nr(), 3);
+        assert_eq!(inner.incoming_buffer[2].timestamp_microseconds(), 256);
 
         // Replacing a packet with a more recent version doesn't work
         packet.set_seq_nr(2);
         packet.set_timestamp_microseconds(456);
 
-        socket.insert_into_buffer(packet.clone());
-        assert_eq!(socket.incoming_buffer.len(), 3);
-        assert_eq!(socket.incoming_buffer[1].seq_nr(), 2);
-        assert_eq!(socket.incoming_buffer[1].timestamp_microseconds(), 128);
+        inner.insert_into_buffer(packet.clone());
+        assert_eq!(inner.incoming_buffer.len(), 3);
+        assert_eq!(inner.incoming_buffer[1].seq_nr(), 2);
+        assert_eq!(inner.incoming_buffer[1].timestamp_microseconds(), 128);
     }
 
     #[test]
@@ -2309,37 +2571,45 @@ mod test {
         let client = iotry!(UtpSocket::bind(client_addr));
         let mut server = iotry!(UtpSocket::bind(server_addr));
 
-        assert!(server.state == SocketState::New);
-        assert!(client.state == SocketState::New);
-
-        // Check proper difference in client's send connection id and receive connection id
-        assert_eq!(client.sender_connection_id,
-                   client.receiver_connection_id + 1);
+        {
+            let inner = server.inner.lock().unwrap();
+            assert!(inner.state == SocketState::New);
+        };
+        {
+            let inner = client.inner.lock().unwrap();
+            assert!(inner.state == SocketState::New);
+            // Check proper difference in client's send connection id and receive connection id
+            assert_eq!(inner.sender_connection_id,
+                       inner.receiver_connection_id + 1);
+        };
 
         let child = thread::spawn(move || {
             let mut client = iotry!(UtpSocket::connect(server_addr));
-            assert!(client.state == SocketState::Connected);
+            {
+                let mut inner = client.inner.lock().unwrap();
+                assert!(inner.state == SocketState::Connected);
 
-            let mut packet = Packet::new();
-            packet.set_wnd_size(BUF_SIZE as u32);
-            packet.set_type(PacketType::Data);
-            packet.set_connection_id(client.sender_connection_id);
-            packet.set_seq_nr(client.seq_nr);
-            packet.set_ack_nr(client.ack_nr);
-            packet.payload = vec![1, 2, 3];
+                let mut packet = Packet::new();
+                packet.set_wnd_size(BUF_SIZE as u32);
+                packet.set_type(PacketType::Data);
+                packet.set_connection_id(inner.sender_connection_id);
+                packet.set_seq_nr(inner.seq_nr);
+                packet.set_ack_nr(inner.ack_nr);
+                packet.payload = vec![1, 2, 3];
 
-            // Send two copies of the packet, with different timestamps
-            for _ in 0u8..2 {
-                packet.set_timestamp_microseconds(now_microseconds());
-                iotry!(client.socket.send_to(&packet.to_bytes()[..], server_addr));
-            }
-            client.seq_nr += 1;
+                // Send two copies of the packet, with different timestamps
+                for _ in 0u8..2 {
+                    packet.set_timestamp_microseconds(now_microseconds());
+                    iotry!(client.socket.send_to(&packet.to_bytes()[..], server_addr));
+                }
+                inner.seq_nr += 1;
 
-            // Receive one ACK
-            for _ in 0u8..1 {
-                let mut buf = [0; BUF_SIZE];
-                iotry!(client.socket.recv_from(&mut buf));
-            }
+                // Receive one ACK
+                for _ in 0u8..1 {
+                    let mut buf = [0; BUF_SIZE];
+                    iotry!(client.socket.recv_from(&mut buf));
+                }
+            };
 
             iotry!(client.close());
         });
@@ -2347,10 +2617,13 @@ mod test {
         let mut buf = [0u8; BUF_SIZE];
         iotry!(server.recv(&mut buf, false));
         // After establishing a new connection, the server's ids are a mirror of the client's.
-        assert_eq!(server.receiver_connection_id,
-                   server.sender_connection_id + 1);
+        {
+            let inner = server.inner.lock().unwrap();
+            assert_eq!(inner.receiver_connection_id,
+                       inner.sender_connection_id + 1);
 
-        assert!(server.state == SocketState::Connected);
+            assert!(inner.state == SocketState::Connected);
+        };
 
         let expected: Vec<u8> = vec![1, 2, 3];
         let mut received: Vec<u8> = vec![];
@@ -2435,27 +2708,30 @@ mod test {
 
         let child = thread::spawn(move || {
             let mut client = iotry!(UtpSocket::connect(server_addr));
+            {
+                let mut inner = client.inner.lock().unwrap();
 
-            // Send everything except the odd chunks
-            let chunks = to_send[..].chunks(BUF_SIZE);
-            let dst = client.connected_to;
-            for (index, chunk) in chunks.enumerate() {
-                let mut packet = Packet::new();
-                packet.set_seq_nr(client.seq_nr);
-                packet.set_ack_nr(client.ack_nr);
-                packet.set_connection_id(client.sender_connection_id);
-                packet.set_timestamp_microseconds(now_microseconds());
-                packet.payload = chunk.to_vec();
-                packet.set_type(PacketType::Data);
+                // Send everything except the odd chunks
+                let chunks = to_send[..].chunks(BUF_SIZE);
+                let dst = inner.connected_to;
+                for (index, chunk) in chunks.enumerate() {
+                    let mut packet = Packet::new();
+                    packet.set_seq_nr(inner.seq_nr);
+                    packet.set_ack_nr(inner.ack_nr);
+                    packet.set_connection_id(inner.sender_connection_id);
+                    packet.set_timestamp_microseconds(now_microseconds());
+                    packet.payload = chunk.to_vec();
+                    packet.set_type(PacketType::Data);
 
-                if index % 2 == 0 {
-                    iotry!(client.socket.send_to(&packet.to_bytes()[..], dst));
+                    if index % 2 == 0 {
+                        iotry!(client.socket.send_to(&packet.to_bytes()[..], dst));
+                    }
+
+                    inner.curr_window += packet.len() as u32;
+                    inner.send_window.push(packet);
+                    inner.seq_nr += 1;
                 }
-
-                client.curr_window += packet.len() as u32;
-                client.send_window.push(packet);
-                client.seq_nr += 1;
-            }
+            };
 
             iotry!(client.close());
         });
@@ -2490,7 +2766,13 @@ mod test {
         });
 
         let mut read = Vec::new();
-        while server.state != SocketState::Closed {
+        loop {
+            {
+                let inner = server.inner.lock().unwrap();
+                if inner.state == SocketState::Closed {
+                    break;
+                };
+            }
             let mut small_buffer = [0; 512];
             match server.recv_from(&mut small_buffer) {
                 Ok((0, _src)) => break,
@@ -2505,6 +2787,10 @@ mod test {
         assert!(child.join().is_ok());
     }
 
+    // TODO(canndrew): This test currently doesn't make any sense.
+    // there's a line `client.seq_nr = ::std::u16::MAX ...`
+    // But then client get's overwritten with a new variable :(
+    /*
     #[test]
     fn test_sequence_number_rollover() {
         let (server_addr, client_addr) = (next_test_ip4(), next_test_ip4());
@@ -2544,6 +2830,7 @@ mod test {
 
         assert!(child.join().is_ok());
     }
+    */
 
     #[test]
     fn test_drop_unused_socket() {
@@ -2625,25 +2912,28 @@ mod test {
         });
 
         let mut client = iotry!(UtpSocket::connect(server_addr));
-        let mut packet = Packet::new();
-        packet.set_wnd_size(BUF_SIZE as u32);
-        packet.set_type(PacketType::Syn);
-        packet.set_connection_id(client.sender_connection_id);
-        packet.set_seq_nr(client.seq_nr);
-        packet.set_ack_nr(client.ack_nr);
+        {
+            let inner = client.inner.lock().unwrap();
+            let mut packet = Packet::new();
+            packet.set_wnd_size(BUF_SIZE as u32);
+            packet.set_type(PacketType::Syn);
+            packet.set_connection_id(inner.sender_connection_id);
+            packet.set_seq_nr(inner.seq_nr);
+            packet.set_ack_nr(inner.ack_nr);
 
-        let other_socket = iotry!(::std::net::UdpSocket::bind("0.0.0.0:0"));
+            let other_socket = iotry!(::std::net::UdpSocket::bind("0.0.0.0:0"));
 
-        iotry!(other_socket.send_to(&packet.to_bytes()[..], server_addr));
+            iotry!(other_socket.send_to(&packet.to_bytes()[..], server_addr));
 
-        let mut buf = [0; BUF_SIZE];
-        match other_socket.recv_from(&mut buf) {
-            Ok((len, _src)) => {
-                let reply = Packet::from_bytes(&buf[..len]).ok().unwrap();
-                assert_eq!(reply.get_type(), PacketType::Reset);
+            let mut buf = [0; BUF_SIZE];
+            match other_socket.recv_from(&mut buf) {
+                Ok((len, _src)) => {
+                    let reply = Packet::from_bytes(&buf[..len]).ok().unwrap();
+                    assert_eq!(reply.get_type(), PacketType::Reset);
+                }
+                Err(e) => panic!("{:?}", e),
             }
-            Err(e) => panic!("{:?}", e),
-        }
+        };
         iotry!(client.close());
 
         assert!(child.join().is_ok());
@@ -2657,12 +2947,13 @@ mod test {
 
         let child = thread::spawn(move || {
             let client = iotry!(UtpSocket::connect(server_addr));
+            let inner = client.inner.lock().unwrap();
             let mut packet = Packet::new();
             packet.set_wnd_size(BUF_SIZE as u32);
             packet.set_type(PacketType::Reset);
-            packet.set_connection_id(client.sender_connection_id);
-            packet.set_seq_nr(client.seq_nr);
-            packet.set_ack_nr(client.ack_nr);
+            packet.set_connection_id(inner.sender_connection_id);
+            packet.set_seq_nr(inner.seq_nr);
+            packet.set_ack_nr(inner.ack_nr);
             iotry!(client.socket.send_to(&packet.to_bytes()[..], server_addr));
             let mut buf = [0; BUF_SIZE];
             match client.socket.recv_from(&mut buf) {
@@ -2705,12 +2996,16 @@ mod test {
         iotry!(server.recv(&mut buf, false));
 
         // Send FIN without acknowledging packets received
-        let mut packet = Packet::new();
-        packet.set_connection_id(server.sender_connection_id);
-        packet.set_seq_nr(server.seq_nr);
-        packet.set_ack_nr(server.ack_nr);
-        packet.set_timestamp_microseconds(now_microseconds());
-        packet.set_type(PacketType::Fin);
+        let packet = {
+            let inner = server.inner.lock().unwrap();
+            let mut packet = Packet::new();
+            packet.set_connection_id(inner.sender_connection_id);
+            packet.set_seq_nr(inner.seq_nr);
+            packet.set_ack_nr(inner.ack_nr);
+            packet.set_timestamp_microseconds(now_microseconds());
+            packet.set_type(PacketType::Fin);
+            packet
+        };
         iotry!(server.socket.send_to(&packet.to_bytes()[..], client_addr));
 
         // Receive until end
@@ -2739,16 +3034,17 @@ mod test {
                            (minute_in_microseconds + 2, 19),
                            (minute_in_microseconds + 3, 9)];
         let addr = next_test_ip4();
-        let mut socket = UtpSocket::bind(addr).unwrap();
+        let socket = UtpSocket::bind(addr).unwrap();
+        let mut inner = socket.inner.lock().unwrap();
 
         for (timestamp, delay) in samples {
-            socket.update_base_delay(delay, timestamp + delay);
+            inner.update_base_delay(delay, timestamp + delay);
         }
 
         let expected = vec![7, 9];
-        let actual = socket.base_delays.iter().map(|&x| x).collect::<Vec<_>>();
+        let actual = inner.base_delays.iter().map(|&x| x).collect::<Vec<_>>();
         assert_eq!(expected, actual);
-        assert_eq!(socket.min_base_delay(), 7);
+        assert_eq!(inner.min_base_delay(), 7);
     }
 
     #[test]
@@ -2832,14 +3128,20 @@ mod test {
         let server_addr = next_test_ip4();
         let mut server = iotry!(UtpSocket::bind(server_addr));
         // Decrease timeouts for faster tests
-        server.congestion_timeout = 1;
-        let attempts = server.max_retransmission_retries;
+        let attempts = {
+            let mut inner = server.inner.lock().unwrap();
+            inner.congestion_timeout = 1;
+            inner.max_retransmission_retries
+        };
 
         let child = thread::spawn(move || {
             let mut client = iotry!(UtpSocket::connect(server_addr));
             iotry!(client.send_to(&[0]));
             // Simulate connection loss by killing the socket.
-            client.state = SocketState::Closed;
+            {
+                let mut inner = client.inner.lock().unwrap();
+                inner.state = SocketState::Closed;
+            }
             let socket = client.socket.try_clone().unwrap();
             let mut buf = [0; BUF_SIZE];
             iotry!(socket.recv_from(&mut buf));
@@ -2876,14 +3178,20 @@ mod test {
         let server_addr = next_test_ip4();
         let mut server = iotry!(UtpSocket::bind(server_addr));
         // Decrease timeouts for faster tests
-        server.congestion_timeout = 1;
-        let attempts = server.max_retransmission_retries;
+        let attempts = {
+            let mut inner = server.inner.lock().unwrap();
+            inner.congestion_timeout = 1;
+            inner.max_retransmission_retries
+        };
 
         let child = thread::spawn(move || {
             let mut client = iotry!(UtpSocket::connect(server_addr));
             iotry!(client.send_to(&[0]));
             // Simulate connection loss by killing the socket.
-            client.state = SocketState::Closed;
+            {
+                let mut inner = client.inner.lock().unwrap();
+                inner.state = SocketState::Closed;
+            }
             let socket = client.socket.try_clone().unwrap();
             let mut buf = [0; BUF_SIZE];
             iotry!(socket.recv_from(&mut buf));
@@ -2916,16 +3224,20 @@ mod test {
         let server_addr = next_test_ip4();
         let mut server = iotry!(UtpSocket::bind(server_addr));
         // Decrease timeouts for faster tests
-        server.congestion_timeout = 1;
-        let attempts = server.max_retransmission_retries;
+        let attempts = {
+            let mut inner = server.inner.lock().unwrap();
+            inner.congestion_timeout = 1;
+            inner.max_retransmission_retries
+        };
 
         let child = thread::spawn(move || {
             let mut client = iotry!(UtpSocket::connect(server_addr));
             iotry!(client.send_to(&[0]));
             // Simulate connection loss by killing the socket.
-            client.state = SocketState::Closed;
+            let mut inner = client.inner.lock().unwrap();
+            inner.state = SocketState::Closed;
             let socket = client.socket.try_clone().unwrap();
-            let seq_nr = client.seq_nr;
+            let seq_nr = inner.seq_nr;
             let mut buf = [0; BUF_SIZE];
             for _ in 0..(3 * attempts) {
                 match socket.recv_from(&mut buf) {
@@ -3053,7 +3365,10 @@ mod test {
         fn sequential_exchange(socket: &mut UtpSocket) {
             let mut i = 0;
             let from = socket.socket.local_addr().map(|addr| addr.port()).unwrap_or(0);
-            let to   = socket.connected_to.port();
+            let to = {
+                let inner = socket.inner.lock().unwrap();
+                inner.connected_to.port();
+            };
 
             while i < MSG_COUNT {
                 let tx_buf = make_buf(i);
@@ -3063,9 +3378,13 @@ mod test {
                 match socket.recv_from(&mut buf) {
                     Ok((cnt, _)) => {
                         if cnt == 0 {
-                            if socket.state != SocketState::Connected {
+                            let state = {
+                                let inner = socket.inner.lock().unwrap();
+                                inner.state
+                            };
+                            if state != SocketState::Connected {
                                 panic!("socket is in an invalid state \"{:?}\" from {:?} to {:?}",
-                                         socket.state, from, to);
+                                         state, from, to);
                             }
                         }
                         assert_eq!(cnt, 10);
@@ -3108,7 +3427,10 @@ mod test {
             let mut send_cnt = 0;
 
             let from = socket.socket.local_addr().map(|addr| addr.port()).unwrap_or(0);
-            let to   = socket.connected_to.port();
+            let to = {
+                let inner = socket.inner.lock().unwrap();
+                inner.connected_to.port();
+            };
 
             loop {
                 if send_cnt < MSG_COUNT {
@@ -3132,10 +3454,14 @@ mod test {
                     match socket.recv_from(&mut buf) {
                         Ok((cnt, _)) => {
                             if cnt == 0 {
-                                if socket.state != SocketState::Connected {
+                                let state = {
+                                    let inner = socket.inner.lock().unwrap();
+                                    inner.state
+                                };
+                                if state != SocketState::Connected {
                                     panic!("socket is in an invalid state \"{:?}\" \
                                            from {:?} to {:?} in receive #{}",
-                                             socket.state, from, to, recv_cnt);
+                                             state, from, to, recv_cnt);
                                 }
                             } else {
                                 assert_eq!(cnt, exp_buf.len());
