@@ -96,8 +96,10 @@ fn unsafe_copy(src: &[u8], dst: &mut [u8]) -> usize {
     max_len
 }
 
+/// Stores the internal state of a `UtpSocket`. This can be shared between many `UtpSocket`s using
+/// the `try_clone` method.
 struct UtpSocketInner {
-    /// Remote peer
+    /// The address of the remote peer the socket is connected to.
     connected_to: SocketAddr,
 
     /// Sender connection identifier
