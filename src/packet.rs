@@ -260,6 +260,7 @@ impl Packet {
             header: header,
             extensions: Vec::new(),
             payload: v,
+            is_pong: false,
         }
     }
 
@@ -414,6 +415,7 @@ impl Decodable for Packet {
             header: header,
             extensions: extensions,
             payload: payload,
+            is_pong: false,
         })
     }
 }
@@ -424,6 +426,7 @@ impl Clone for Packet {
             header: self.header,
             extensions: self.extensions.clone(),
             payload: self.payload.clone(),
+            is_pong: self.is_pong,
         }
     }
 }
