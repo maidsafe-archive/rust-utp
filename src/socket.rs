@@ -1384,7 +1384,7 @@ impl UtpSocket {
         // Three duplicate ACKs mean a fast resend request. Resend the first unacknowledged packet
         // if the incoming packet doesn't have a SACK extension. If it does, the lost packets were
         // already resent.
-        if packet_loss_detected && self.duplicate_ack_count == 3 &&
+        if packet_loss_detected &&
            !packet.extensions.iter().any(|ext| ext.get_type() == ExtensionType::SelectiveAck) {
             self.resend_lost_packet(packet.ack_nr().wrapping_add(1));
         }
