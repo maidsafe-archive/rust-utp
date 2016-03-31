@@ -228,6 +228,7 @@ pub struct Packet {
     header: PacketHeader,
     pub extensions: Vec<Extension>,
     pub payload: Vec<u8>,
+    pub is_pong: bool,
 }
 
 impl Packet {
@@ -237,6 +238,7 @@ impl Packet {
             header: PacketHeader::default(),
             extensions: Vec::new(),
             payload: Vec::new(),
+            is_pong: false,
         }
     }
 

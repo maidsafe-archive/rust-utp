@@ -919,6 +919,19 @@ impl UtpSocket {
         let _ = self.socket.send_to(&packet.to_bytes()[..], self.connected_to);
     }
 
+    fn send_pong(&self) {
+        let mut packet = Packet::new();
+        packet.is_pong = true;
+        packet.set_type(PacketType::State);
+        let self_t_micro: u32 = now_microseconds();
+        packet.set_timestamp_microseconds(self_t_micro);
+        packet.set_timestamp_difference_microseconds(self.their_delay);
+        packet.set_connection_id(self.sender_connection_id);
+        packet.set_seq_nr(self.seq_nr);
+        packet.set_ack_nr(self.ack_nr);
+        let _ = self.socket.send_to(&packet.to_bytes()[..], self.connected_to);
+    }
+
     /// Send a keepalive packet on the stream.
     pub fn send_keepalive(&self) {
         if now_microseconds().wrapping_sub(self.last_acked_timestamp) > 14_000_000 {
@@ -1198,7 +1211,9 @@ impl UtpSocket {
             (SocketState::FinSent, PacketType::Data) => Ok(self.handle_data_packet(packet)),
             (SocketState::Connected, PacketType::State) => {
                 self.handle_state_packet(packet);
-                self.send_state();
+                if !packet.is_pong {
+                    self.send_pong();
+                }
                 Ok(None)
             }
             (SocketState::Connected, PacketType::Fin) |
