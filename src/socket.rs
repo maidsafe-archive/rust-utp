@@ -1211,6 +1211,11 @@ impl UtpSocket {
             (SocketState::FinSent, PacketType::Data) => Ok(self.handle_data_packet(packet)),
             (SocketState::Connected, PacketType::State) => {
                 self.handle_state_packet(packet);
+                if !packet.is_pong {
+                    let mut reply = self.prepare_reply(packet, PacketType::State);
+                    reply.is_pong = true;
+                    return Ok(Some(reply));
+                }
                 Ok(None)
             }
             (SocketState::Connected, PacketType::Fin) |

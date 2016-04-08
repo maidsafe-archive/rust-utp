@@ -228,6 +228,7 @@ pub struct Packet {
     header: PacketHeader,
     pub extensions: Vec<Extension>,
     pub payload: Vec<u8>,
+    pub is_pong: bool,
 }
 
 impl Packet {
@@ -237,6 +238,7 @@ impl Packet {
             header: PacketHeader::default(),
             extensions: Vec::new(),
             payload: Vec::new(),
+            is_pong: false,
         }
     }
 
@@ -258,6 +260,7 @@ impl Packet {
             header: header,
             extensions: Vec::new(),
             payload: v,
+            is_pong: false,
         }
     }
 
@@ -334,11 +337,14 @@ impl Encodable for Packet {
 
         // Copy payload
         unsafe {
+            let mut payload = self.payload.clone();
+            payload.push(if self.is_pong { 1 } else { 0 });
+
             let buf_len = buf.len();
-            ptr::copy(self.payload.as_ptr(),
+            ptr::copy(payload.as_ptr(),
                       buf.as_mut_ptr().offset(buf.len() as isize),
-                      self.payload.len());
-            buf.set_len(buf_len + self.payload.len());
+                      payload.len());
+            buf.set_len(buf_len + payload.len());
         }
 
         buf
@@ -408,10 +414,13 @@ impl Decodable for Packet {
             payload = Vec::new();
         }
 
+        let is_pong = payload.pop().unwrap() == 1;
+
         Ok(Packet {
             header: header,
             extensions: extensions,
             payload: payload,
+            is_pong: is_pong,
         })
     }
 }
@@ -422,6 +431,7 @@ impl Clone for Packet {
             header: self.header,
             extensions: self.extensions.clone(),
             payload: self.payload.clone(),
+            is_pong: self.is_pong,
         }
     }
 }
