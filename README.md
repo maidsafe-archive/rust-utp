@@ -1,3 +1,9 @@
+# ***This repository is no longer maintained***
+# It has been moved to the maidsafe-archive organisation for reference only
+#
+#
+#
+#
 # rust-utp
 
 [![Crate Version](https://img.shields.io/crates/v/utp.svg?style=flat)](https://crates.io/crates/utp)
